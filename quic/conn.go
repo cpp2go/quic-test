@@ -106,7 +106,7 @@ type sentPacket struct {
 	retransmitted  bool
 }
 
-func newServerConnection(conn net.PacketConn, remoteAddr net.Addr, destConnID, srcConnID protocol.ConnectionID, version protocol.Version) *Connection {
+func newServerConnection(conn net.PacketConn, remoteAddr net.Addr, destConnID, srcConnID protocol.ConnectionID, version protocol.Version, cfg *Config) *Connection {
 	c := &Connection{
 		version:             version,
 		destConnID:          destConnID,
@@ -126,7 +126,7 @@ func newServerConnection(conn net.PacketConn, remoteAddr net.Addr, destConnID, s
 		sendPacketHistory:   make([]sentPacket, 0),
 		immediateAckCh:      make(chan struct{}, 100),
 		rttStats:            utils.NewRTTStats(),
-		congestion:          utils.NewBBR(),
+		congestion:          newController(cfg),
 		retransmitQueue:     make([]sentPacket, 0),
 		detectedLostPackets: make([]protocol.PacketNumber, 0),
 		remoteMaxStreamData: make(map[protocol.StreamID]protocol.ByteCount),
@@ -137,15 +137,22 @@ func newServerConnection(conn net.PacketConn, remoteAddr net.Addr, destConnID, s
 	}
 	c.connected.Store(true)
 	c.congestion.OnPacketSent(0) // initialize
-	// Initialize BBR's RTT stats reference
-	if bbr, ok := c.congestion.(*utils.BBR); ok {
-		bbr.SetRTTStats(c.rttStats)
-	}
+	// Pass RTT stats to congestion controller
+	c.initCongestionRTT()
 	go c.run()
 	return c
 }
 
-func newClientConnection(conn net.PacketConn, remoteAddr net.Addr, destConnID, srcConnID protocol.ConnectionID, version protocol.Version) *Connection {
+func (c *Connection) initCongestionRTT() {
+	switch cc := c.congestion.(type) {
+	case *utils.BBR:
+		cc.SetRTTStats(c.rttStats)
+	case *utils.Cubic:
+		cc.SetRTT(c.rttStats.SmoothedRTT())
+	}
+}
+
+func newClientConnection(conn net.PacketConn, remoteAddr net.Addr, destConnID, srcConnID protocol.ConnectionID, version protocol.Version, cfg *Config) *Connection {
 	c := &Connection{
 		version:             version,
 		destConnID:          destConnID,
@@ -165,7 +172,7 @@ func newClientConnection(conn net.PacketConn, remoteAddr net.Addr, destConnID, s
 		sendPacketHistory:   make([]sentPacket, 0),
 		immediateAckCh:      make(chan struct{}, 100),
 		rttStats:            utils.NewRTTStats(),
-		congestion:          utils.NewNewReno(),
+		congestion:          newController(cfg),
 		retransmitQueue:     make([]sentPacket, 0),
 		detectedLostPackets: make([]protocol.PacketNumber, 0),
 		remoteMaxStreamData: make(map[protocol.StreamID]protocol.ByteCount),
@@ -176,10 +183,7 @@ func newClientConnection(conn net.PacketConn, remoteAddr net.Addr, destConnID, s
 	}
 	c.connected.Store(true)
 	c.congestion.OnPacketSent(0) // initialize
-	// Initialize BBR's RTT stats reference
-	if bbr, ok := c.congestion.(*utils.BBR); ok {
-		bbr.SetRTTStats(c.rttStats)
-	}
+	c.initCongestionRTT()
 	go c.run()
 	go c.startReadLoop()
 	return c

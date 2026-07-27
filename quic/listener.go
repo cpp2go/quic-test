@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"quic-test/quic/protocol"
+	"quic-test/quic/utils"
 	"quic-test/quic/wire"
 )
 
@@ -27,10 +28,20 @@ type Listener struct {
 	done      chan struct{}
 }
 
+// Congestion control algorithm names.
+const (
+	CongestionCUBIC   = "CUBIC"
+	CongestionBBR     = "BBR"
+	CongestionNewReno = "NewReno"
+)
+
 // Config holds QUIC configuration.
 type Config struct {
 	MaxIncomingStreams int64
 	MaxIdleTimeout     time.Duration
+	// CongestionControl selects the congestion control algorithm.
+	// Options: "CUBIC" (default), "BBR", "NewReno".
+	CongestionControl string
 }
 
 // DefaultConfig returns a default configuration.
@@ -38,6 +49,7 @@ func DefaultConfig() *Config {
 	return &Config{
 		MaxIncomingStreams: 100,
 		MaxIdleTimeout:     30 * time.Second,
+		CongestionControl:  CongestionCUBIC,
 	}
 }
 
@@ -102,6 +114,21 @@ func (l *Listener) Close() error {
 		}
 	})
 	return nil
+}
+
+// newController creates a congestion controller based on config.
+func newController(cfg *Config) utils.Controller {
+	if cfg == nil {
+		cfg = DefaultConfig()
+	}
+	switch cfg.CongestionControl {
+	case CongestionBBR:
+		return utils.NewBBR()
+	case CongestionNewReno:
+		return utils.NewNewReno()
+	default:
+		return utils.NewCubic()
+	}
 }
 
 // Addr returns the first listener's network address.
@@ -232,6 +259,7 @@ func (l *Listener) dispatchPacket(data []byte, remoteAddr net.Addr) {
 		hdr.SrcConnectionID,
 		serverConnID,
 		hdr.Version,
+		l.config,
 	)
 
 	// Register the connection atomically in both maps
@@ -374,6 +402,7 @@ func dialOne(ctx context.Context, addr string, config *Config) (*Connection, err
 		initialDestConnID,
 		clientConnID,
 		protocol.Version1,
+		config,
 	)
 
 	conn.sendConnectionSetup()

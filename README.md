@@ -9,6 +9,7 @@
 | ✅ QUIC 长/短包头 | 完成 | RFC 9000 兼容格式 |
 | ✅ 流多路复用 | 完成 | Stream ID 管理，双向/单向流 |
 | ✅ SACK (多Range ACK) | 完成 | QUIC ACK 帧原生支持多段不连续确认 |
+| ✅ CUBIC 拥塞控制 | 完成 | 三次函数窗口增长 (RFC 8312)，默认算法 |
 | ✅ BBR 拥塞控制 | 完成 | 基于模型的拥塞控制，弱网友好 |
 | ✅ NewReno 拥塞控制 | 完成 | 备选算法，TCP 友好 |
 | ✅ RTT 估算 | 完成 | 平滑 RTT + RTTVAR (RFC 6298) |
@@ -89,11 +90,16 @@ Happy Eyeballs: 选用 #0 [::1]:4242 (0s)
 ### 服务端
 
 ```go
+// 选择拥塞控制算法
+cfg := &quic.Config{
+    CongestionControl: quic.CongestionCUBIC,
+}
+
 // 单地址监听
-listener, err := quic.ListenAddr(":4242", nil)
+listener, err := quic.ListenAddr(":4242", cfg)
 
 // 多地址监听
-listener := quic.ListenAddrs([]*net.UDPConn{conn1, conn2}, nil)
+listener := quic.ListenAddrs([]*net.UDPConn{conn1, conn2}, cfg)
 
 // 接受连接
 conn, err := listener.Accept(ctx)
@@ -103,10 +109,10 @@ conn, err := listener.Accept(ctx)
 
 ```go
 // 单地址连接
-conn, err := quic.Dial(ctx, "127.0.0.1:4242", nil)
+conn, err := quic.Dial(ctx, "127.0.0.1:4242", cfg)
 
 // Happy Eyeballs 多路径并发
-conn, err := quic.DialHappy(ctx, []string{"[::1]:4242", "127.0.0.1:4242"}, nil)
+conn, err := quic.DialHappy(ctx, []string{"[::1]:4242", "127.0.0.1:4242"}, cfg)
 ```
 
 ### 流操作
@@ -128,23 +134,42 @@ stream.Close()
 
 ## 拥塞控制
 
-默认使用 **BBR**，可在 `conn.go` 构造器中切换为 NewReno：
+通过 `Config` 初始化时选择算法，客户端和服务端共用同一套逻辑：
 
 ```go
-// BBR（默认，弱网友好）
-congestion: utils.NewBBR()
+cfg := &quic.Config{CongestionControl: quic.CongestionCUBIC} // 默认
+// 或: quic.CongestionBBR
+// 或: quic.CongestionNewReno
 
-// NewReno（TCP 友好，备选）
-congestion: utils.NewNewReno()
+// 服务端
+listener := quic.ListenAddr(":4242", cfg)
+
+// 客户端
+conn, err := quic.Dial(ctx, "127.0.0.1:4242", cfg)
 ```
 
-### BBR 状态机
+### CUBIC（默认，RFC 8312）
+
+三次函数窗口增长，Linux 内核默认算法：
+
+```
+W_cubic(t) = C × (t - K)³ + W_max      C = 0.4
+K = ³√(W_max × β / C)                   β = 0.3
+```
+
+| 阶段 | 行为 |
+|------|------|
+| **慢启动** | 指数增长到 ssthresh |
+| **拥塞避免** | CUBIC 模式：S 形三次曲线增长 |
+| **TCP 模式** | 当 W_cubic ≤ W_tcp 时，保持 TCP 友好 |
+| **丢包恢复** | cwnd ×= 0.7，记录 W_max，重新计算 K |
+
+### BBR
+
+基于模型的拥塞控制，弱网友好：
 
 ```
 Startup → Drain → ProbeBW ↔ ProbeRTT
-  │          │        │          │
-  │ BW不再增长 │ bytes<=BDP │ 10s无新minRTT │ 200ms后退出
-  └──────────┘        └──────────┘
 ```
 
 | 阶段 | 行为 |
@@ -153,6 +178,10 @@ Startup → Drain → ProbeBW ↔ ProbeRTT
 | **Drain** | 增益 1/2.77，排空 Startup 积累的队列 |
 | **ProbeBW** | 8 相位增益循环 [1.25, 0.75, 1.0×6] |
 | **ProbeRTT** | 降 cwnd 到 4×MSS，刷新 minRTT |
+
+### NewReno
+
+经典基于丢包的拥塞控制，TCP 友好。
 
 ## 连接迁移
 
@@ -167,14 +196,17 @@ Startup → Drain → ProbeBW ↔ ProbeRTT
  → 确认迁移完成
 ```
 
-## 弱网优化对比
+## 算法对比
 
-| 场景 | NewReno | BBR |
-|------|---------|-----|
-| 高丢包(>1%) | 吞吐降 50%+ | 几乎不受影响 |
-| Bufferbloat | 严重 | 轻微 |
-| 高延迟(>200ms) | 恢复慢 | 主动探测带宽 |
-| 无线网络 | 差（误判拥塞） | 好（区分丢包） |
+| 场景 | CUBIC (默认) | BBR | NewReno |
+|------|-------------|-----|---------|
+| 高带宽长延迟 | ✅ 好 | ✅ 优 | ❌ 差 |
+| 高丢包(>1%) | ❌ 降 30% | ✅ 几乎不受影响 | ❌ 降 50%+ |
+| Bufferbloat | ⚠️ 中等 | ✅ 轻微 | ❌ 严重 |
+| 高延迟(>200ms) | ✅ 时间驱动 | ✅ 主动探测 | ❌ RTT 依赖 |
+| 无线网络 | ❌ 丢包敏感 | ✅ 好 | ❌ 差 |
+| TCP 友好 | ✅ 设计目标 | ⚠️ 略差 | ✅ 友好 |
+| 实现复杂度 | ⚠️ 中等 | ❌ 复杂 | ✅ 简单 |
 
 ## 测试
 

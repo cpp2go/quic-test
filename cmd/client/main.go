@@ -11,11 +11,16 @@ import (
 )
 
 func main() {
+	// 选择拥塞控制算法: CUBIC / BBR / NewReno
+	cfg := &quic.Config{
+		CongestionControl: quic.CongestionBBR,
+	}
+
 	// Happy Eyeballs: 优先 IPv6，300ms 超时后并发 IPv4
 	addrs := []string{"[::1]:4242", "127.0.0.1:4242"}
-	fmt.Println("Happy Eyeballs: 尝试", addrs)
+	fmt.Printf("Happy Eyeballs: 尝试 %v (算法: %s)\n", addrs, cfg.CongestionControl)
 
-	conn, err := quic.DialHappy(context.Background(), addrs, nil)
+	conn, err := quic.DialHappy(context.Background(), addrs, cfg)
 	if err != nil {
 		log.Fatal(err)
 	}

@@ -41,7 +41,10 @@ func echoServer() error {
 		return fmt.Errorf("没有可用的监听地址")
 	}
 
-	listener := quic.ListenAddrs(udpConns, nil)
+	cfg := &quic.Config{
+		CongestionControl: quic.CongestionCUBIC, // 可选: CUBIC / BBR / NewReno
+	}
+	listener := quic.ListenAddrs(udpConns, cfg)
 	defer listener.Close()
 
 	for {
