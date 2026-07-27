@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"quic-test/quic/protocol"
+	"quic-test/quic/quicvarint"
 	"quic-test/quic/utils"
 	"quic-test/quic/wire"
 )
@@ -94,6 +95,9 @@ type Connection struct {
 	connected atomic.Bool
 	closed    atomic.Bool
 
+	// Current max packet size (starts at InitialPacketSize, may increase via MTU discovery)
+	maxPacketSize protocol.ByteCount
+
 	logf func(format string, args ...interface{})
 }
 
@@ -131,6 +135,7 @@ func newServerConnection(conn net.PacketConn, remoteAddr net.Addr, destConnID, s
 		detectedLostPackets: make([]protocol.PacketNumber, 0),
 		remoteMaxStreamData: make(map[protocol.StreamID]protocol.ByteCount),
 		localMaxStreamData:  make(map[protocol.StreamID]protocol.ByteCount),
+		maxPacketSize:       protocol.InitialPacketSize,
 		logf: func(format string, args ...interface{}) {
 			fmt.Printf("[server] "+format+"\n", args...)
 		},
@@ -177,6 +182,7 @@ func newClientConnection(conn net.PacketConn, remoteAddr net.Addr, destConnID, s
 		detectedLostPackets: make([]protocol.PacketNumber, 0),
 		remoteMaxStreamData: make(map[protocol.StreamID]protocol.ByteCount),
 		localMaxStreamData:  make(map[protocol.StreamID]protocol.ByteCount),
+		maxPacketSize:       protocol.InitialPacketSize,
 		logf: func(format string, args ...interface{}) {
 			fmt.Printf("[client] "+format+"\n", args...)
 		},
@@ -704,6 +710,22 @@ func (c *Connection) sendFrame(frame wire.Frame) {
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
 
+	// Truncate stream frame data to fit within maxPacketSize
+	if sf, ok := frame.(*wire.StreamFrame); ok {
+		overhead := 1 /* type byte */ + int(protocol.ByteCount(quicvarint.Len(uint64(sf.StreamID)))) +
+			int(protocol.ByteCount(quicvarint.Len(uint64(sf.Offset)))) +
+			int(protocol.ByteCount(quicvarint.Len(uint64(len(sf.Data))))) +
+			5 /* short header overhead */
+		maxData := int(c.maxPacketSize) - overhead
+		if maxData < 0 {
+			maxData = 0
+		}
+		if len(sf.Data) > maxData {
+			sf.Data = sf.Data[:maxData]
+			sf.DataLenPresent = true
+		}
+	}
+
 	// Check congestion window (advisory - still send but log for diagnostics)
 	frameLen := estimateFrameLength(frame, c.version)
 	if !c.congestion.CanSend(frameLen) {
@@ -746,6 +768,21 @@ func (c *Connection) sendFrame(frame wire.Frame) {
 	_, err = c.conn.WriteTo(c.sendBuf, c.remoteAddr)
 	if err != nil {
 		c.logf("error sending packet: %v", err)
+	}
+}
+
+// MaxPacketSize returns the current maximum packet size.
+func (c *Connection) MaxPacketSize() protocol.ByteCount {
+	return c.maxPacketSize
+}
+
+// SetMaxPacketSize updates the maximum packet size (used by MTU discovery).
+func (c *Connection) SetMaxPacketSize(size protocol.ByteCount) {
+	if size > protocol.MaxPacketBufferSize {
+		size = protocol.MaxPacketBufferSize
+	}
+	if size >= protocol.MinInitialPacketSize {
+		c.maxPacketSize = size
 	}
 }
 
@@ -809,9 +846,13 @@ func (c *Connection) sendInitialPacket(frame wire.Frame) {
 	payloadLen := int(pnLen) + frameLen
 	wire.SetLength(c.sendBuf, protocol.ByteCount(payloadLen))
 
-	// Pad to minimum initial size if needed
+	// Pad to minimum initial size if needed, but cap at InitialPacketSize
 	for len(c.sendBuf) < protocol.MinInitialPacketSize {
 		c.sendBuf = append(c.sendBuf, 0x00)
+	}
+	// Trim to maxPacketSize if it somehow exceeded
+	if len(c.sendBuf) > int(c.maxPacketSize) {
+		c.sendBuf = c.sendBuf[:c.maxPacketSize]
 	}
 
 	// Record

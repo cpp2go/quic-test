@@ -24,6 +24,9 @@ const MaxByteCount = ByteCount(1<<62 - 1)
 // MaxPacketBufferSize is the maximum UDP payload size we use.
 const MaxPacketBufferSize = 1452
 
+// InitialPacketSize is the initial (before Path MTU discovery) maximum packet size.
+const InitialPacketSize = 1280
+
 // MinInitialPacketSize is the minimum size of an Initial packet (RFC 9000).
 const MinInitialPacketSize = 1200
 
