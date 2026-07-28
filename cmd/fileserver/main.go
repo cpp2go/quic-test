@@ -293,34 +293,12 @@ func formatSize(bytes int64) string {
 
 // listenAllIPs 遍历本机所有网卡，对每个 IP 地址尝试绑定 UDP 端口。
 func listenAllIPs(port int) ([]*net.UDPConn, error) {
-	seen := make(map[string]bool) // 去重
+	seen := make(map[string]bool)
 	var conns []*net.UDPConn
 
-	// 先尝试通配地址
-	// 注意: Windows 上 IPv6 默认双栈，[::]:port 会同时占用 IPv4，
-	// 此时再绑 0.0.0.0:port 会报 EADDRINUSE，跳过即可。
-	for _, addr := range []string{fmt.Sprintf("[::]:%d", port), fmt.Sprintf("0.0.0.0:%d", port)} {
-		udpAddr, err := net.ResolveUDPAddr("udp", addr)
-		if err != nil {
-			log.Printf("解析 %s 失败: %v", addr, err)
-			continue
-		}
-		conn, err := net.ListenUDP("udp", udpAddr)
-		if err != nil {
-			// Windows 双栈下 0.0.0.0 绑定冲突属正常现象
-			fmt.Printf("  (%s 已被占用，跳过)\n", addr)
-			continue
-		}
-		conns = append(conns, conn)
-		fmt.Println("文件传输服务器监听:", conn.LocalAddr())
-		seen[conn.LocalAddr().String()] = true
-	}
-
-	// 遍历所有网卡补充绑定具体 IP（某些场景需要显式绑定）
 	interfaces, err := net.Interfaces()
 	if err != nil {
-		log.Printf("获取网卡列表失败: %v", err)
-		return conns, nil
+		return nil, fmt.Errorf("获取网卡列表失败: %w", err)
 	}
 
 	for _, iface := range interfaces {
@@ -350,7 +328,7 @@ func listenAllIPs(port int) ([]*net.UDPConn, error) {
 			}
 			conn, err := net.ListenUDP("udp", udpAddr)
 			if err != nil {
-				log.Printf("监听 %s 失败: %v", addrStr, err)
+				fmt.Printf("  (监听 %s 失败: %v)\n", addrStr, err)
 				continue
 			}
 			conns = append(conns, conn)
