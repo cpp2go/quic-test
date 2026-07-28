@@ -224,6 +224,16 @@ func (s *Stream) handleStreamData(offset protocol.ByteCount, data []byte, fin bo
 		return
 	}
 
+	// 丢弃重复/已消耗的数据（重传包会携带相同偏移量的数据）
+	if offset+protocol.ByteCount(len(data)) <= s.readOffset {
+		// 如果当前包还带 FIN，确保 finRead 被设置
+		if fin && s.readBuf == nil {
+			s.finRead = true
+			s.readCond.Broadcast()
+		}
+		return
+	}
+
 	// Handle out-of-order data by appending to buffer
 	// For simplicity, we assume in-order delivery for now
 	if offset == s.readOffset {
