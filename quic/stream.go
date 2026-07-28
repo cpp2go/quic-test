@@ -33,6 +33,10 @@ type Stream struct {
 	maxData     protocol.ByteCount // max data we can send
 	readMaxData protocol.ByteCount // max data remote can send
 
+	// Out-of-order reassembly
+	pending   map[protocol.ByteCount][]byte // offset → data
+	pendingFn bool                          // pending FIN
+
 	finalSize protocol.ByteCount
 	finRead   bool
 	finSent   bool
@@ -44,6 +48,7 @@ func newStream(streamID protocol.StreamID, conn *Connection) *Stream {
 		conn:        conn,
 		maxData:     65536, // initial flow control limit
 		readMaxData: 65536, // initial flow control limit
+		pending:     make(map[protocol.ByteCount][]byte),
 	}
 	s.readCond = sync.NewCond(&s.mu)
 	s.writeCond = sync.NewCond(&s.mu)
@@ -162,10 +167,10 @@ func (s *Stream) Write(b []byte) (int, error) {
 
 		chunk := b[written : written+chunkSize]
 		s.mu.Lock()
-		s.conn.sendStreamData(s.streamID, s.writeOffset, chunk, false)
-		s.writeOffset += protocol.ByteCount(len(chunk))
+		actualSent := s.conn.sendStreamData(s.streamID, s.writeOffset, chunk, false)
+		s.writeOffset += protocol.ByteCount(actualSent)
 		s.mu.Unlock()
-		written += chunkSize
+		written += actualSent
 	}
 
 	return written, nil
@@ -225,6 +230,19 @@ func (s *Stream) SetDeadline(t time.Time) error {
 	return nil
 }
 
+// tryFlushPending 检查 pending 中是否有可拼接到 readBuf 的数据
+func (s *Stream) tryFlushPending() {
+	for {
+		chunk, ok := s.pending[s.readOffset]
+		if !ok {
+			break
+		}
+		s.readBuf = append(s.readBuf, chunk...)
+		s.readOffset += protocol.ByteCount(len(chunk))
+		delete(s.pending, s.readOffset-protocol.ByteCount(len(chunk)))
+	}
+}
+
 // handleStreamData processes incoming stream data.
 func (s *Stream) handleStreamData(offset protocol.ByteCount, data []byte, fin bool) {
 	s.mu.Lock()
@@ -235,29 +253,35 @@ func (s *Stream) handleStreamData(offset protocol.ByteCount, data []byte, fin bo
 	}
 
 	// 丢弃重复/已消耗的数据（重传包会携带相同偏移量的数据）
-	if offset+protocol.ByteCount(len(data)) <= s.readOffset {
-		// 如果当前包还带 FIN，确保 finRead 被设置
-		if fin && s.readBuf == nil {
-			s.finRead = true
-			s.readCond.Broadcast()
+	end := offset + protocol.ByteCount(len(data))
+	if end <= s.readOffset {
+		if fin {
+			s.tryFlushPending()
+			if len(s.pending) == 0 {
+				s.finRead = true
+				s.readCond.Broadcast()
+			}
 		}
 		return
 	}
 
-	// Handle out-of-order data by appending to buffer
-	// For simplicity, we assume in-order delivery for now
 	if offset == s.readOffset {
+		// 按序到达，直接追加
 		s.readBuf = append(s.readBuf, data...)
-		s.readOffset = offset + protocol.ByteCount(len(data))
+		s.readOffset = end
 		if fin {
 			s.finRead = true
 		}
+		// 尝试拼接 pending 中的后续数据
+		s.tryFlushPending()
 		s.readCond.Broadcast()
 	} else {
-		// Out-of-order data; store for later reassembly
-		// Simple approach: just append and sort later
-		s.readBuf = append(s.readBuf, data...)
-		s.readCond.Broadcast()
+		// 乱序到达，暂存到 pending 等待按序拼接
+		// 如果该偏移量的数据已存在则覆盖（重传场景）
+		s.pending[offset] = data
+		if fin {
+			s.pendingFn = true
+		}
 	}
 }
 

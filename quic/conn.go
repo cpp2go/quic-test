@@ -681,7 +681,9 @@ func (c *Connection) handleStopSendingFrame(f *wire.StopSendingFrame) {
 }
 
 // sendStreamData sends data on a stream.
-func (c *Connection) sendStreamData(streamID protocol.StreamID, offset protocol.ByteCount, data []byte, fin bool) {
+// sendStreamData sends stream data and returns the actual number of bytes sent
+// (may be less than len(data) due to packet size truncation).
+func (c *Connection) sendStreamData(streamID protocol.StreamID, offset protocol.ByteCount, data []byte, fin bool) int {
 	frame := &wire.StreamFrame{
 		StreamID:       streamID,
 		Offset:         offset,
@@ -690,6 +692,8 @@ func (c *Connection) sendStreamData(streamID protocol.StreamID, offset protocol.
 		DataLenPresent: true,
 	}
 	c.sendFrame(frame)
+	// sendFrame 可能截断了 sf.Data，返回实际发送的字节数
+	return len(frame.Data)
 }
 
 // sendMaxStreamData sends a MAX_STREAM_DATA frame.
@@ -710,13 +714,18 @@ func (c *Connection) sendFrame(frame wire.Frame) {
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
 
-	// Truncate stream frame data to fit within maxPacketSize
+	// 计算实际包开销，精确截断流数据以避免超 MTU
 	if sf, ok := frame.(*wire.StreamFrame); ok {
-		overhead := 1 /* type byte */ + int(protocol.ByteCount(quicvarint.Len(uint64(sf.StreamID)))) +
-			int(protocol.ByteCount(quicvarint.Len(uint64(sf.Offset)))) +
-			int(protocol.ByteCount(quicvarint.Len(uint64(len(sf.Data))))) +
-			5 /* short header overhead */
-		maxData := int(c.maxPacketSize) - overhead
+		// 短包头: 1(type) + connID + pnLen(最大4)
+		shortHdrOverhead := 1 + c.destConnID.Len() + 4
+		// 帧开销: 1(type) + streamID(varint) + [offset(varint)] + dataLen(varint)
+		frameOverhead := 1
+		frameOverhead += int(quicvarint.Len(uint64(sf.StreamID)))
+		if sf.Offset > 0 {
+			frameOverhead += int(quicvarint.Len(uint64(sf.Offset)))
+		}
+		frameOverhead += int(quicvarint.Len(uint64(len(sf.Data))))
+		maxData := int(c.maxPacketSize) - shortHdrOverhead - frameOverhead
 		if maxData < 0 {
 			maxData = 0
 		}
