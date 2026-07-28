@@ -92,9 +92,9 @@ func (s *Stream) Read(b []byte) (int, error) {
 			return n, nil
 		}
 
-		// 阻塞前发送一次流控更新（多帧打包+100ms定时器已提供冗余，不再多发）
+		// 阻塞前发送流控更新，每次递增保证重复发送时值不断增大
 		if s.reassemblyOffset > 0 {
-			s.readMaxData = s.reassemblyOffset + 65536
+			s.readMaxData += 65536
 			s.conn.sendMaxStreamData(s.streamID, s.readMaxData)
 		}
 
