@@ -685,7 +685,7 @@ func (c *Connection) handleStopSendingFrame(f *wire.StopSendingFrame) {
 
 // sendStreamData sends data on a stream.
 // sendStreamData sends stream data and returns the actual number of bytes sent
-// (may be less than len(data) due to packet size truncation).
+// (may be less than len(data) due to packet size truncation or congestion).
 func (c *Connection) sendStreamData(streamID protocol.StreamID, offset protocol.ByteCount, data []byte, fin bool) int {
 	frame := &wire.StreamFrame{
 		StreamID:       streamID,
@@ -694,7 +694,10 @@ func (c *Connection) sendStreamData(streamID protocol.StreamID, offset protocol.
 		Fin:            fin,
 		DataLenPresent: true,
 	}
-	c.sendFrame(frame)
+	if !c.sendFrame(frame) {
+		// 拥塞窗口满，未发送，data 被置为 nil
+		return 0
+	}
 	// sendFrame 可能截断了 sf.Data，返回实际发送的字节数
 	return len(frame.Data)
 }
@@ -709,9 +712,10 @@ func (c *Connection) sendMaxStreamData(streamID protocol.StreamID, maxData proto
 }
 
 // sendFrame serializes and sends a frame.
-func (c *Connection) sendFrame(frame wire.Frame) {
+// Returns true if the frame was actually sent, false if it was queued/dropped.
+func (c *Connection) sendFrame(frame wire.Frame) bool {
 	if c.closed.Load() {
-		return
+		return false
 	}
 
 	c.sendMu.Lock()
@@ -736,12 +740,12 @@ func (c *Connection) sendFrame(frame wire.Frame) {
 			sf.Data = sf.Data[:maxData]
 			sf.DataLenPresent = true
 		}
-	}
 
-	// Check congestion window (advisory - still send but log for diagnostics)
-	frameLen := estimateFrameLength(frame, c.version)
-	if !c.congestion.CanSend(frameLen) {
-		c.logf("拥塞告警: cwnd=%d inFlight=%d, 仍发送", c.congestion.Cwnd(), c.congestion.BytesInFlight())
+		// STREAM 帧遵守拥塞窗口，避免网络过载导致控制帧也一起丢失
+		if !c.congestion.CanSend(int64(len(sf.Data))) {
+			sf.Data = nil // 标记未发送，调用方会重试
+			return false
+		}
 	}
 
 	// Build packet
@@ -760,7 +764,7 @@ func (c *Connection) sendFrame(frame wire.Frame) {
 	c.sendBuf, err = frame.Append(c.sendBuf, c.version)
 	if err != nil {
 		c.logf("error appending frame: %v", err)
-		return
+		return false
 	}
 
 	packetSize := int64(len(c.sendBuf))
@@ -781,6 +785,7 @@ func (c *Connection) sendFrame(frame wire.Frame) {
 	if err != nil {
 		c.logf("error sending packet: %v", err)
 	}
+	return true
 }
 
 // MaxPacketSize returns the current maximum packet size.

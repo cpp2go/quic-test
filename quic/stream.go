@@ -166,9 +166,15 @@ func (s *Stream) Write(b []byte) (int, error) {
 		chunk := b[written : written+chunkSize]
 		s.mu.Lock()
 		actualSent := s.conn.sendStreamData(s.streamID, s.writeOffset, chunk, false)
-		s.writeOffset += protocol.ByteCount(actualSent)
+		if actualSent > 0 {
+			s.writeOffset += protocol.ByteCount(actualSent)
+		}
 		s.mu.Unlock()
 		written += actualSent
+		// 拥塞窗口满时短暂等待 ACK 到来释放窗口
+		if actualSent == 0 {
+			time.Sleep(time.Millisecond)
+		}
 	}
 
 	return written, nil
