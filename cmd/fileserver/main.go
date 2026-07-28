@@ -156,14 +156,16 @@ func handleUpload(stream *quic.Stream) {
 			fmt.Printf("读取流数据失败: %v\n", err)
 			return
 		}
-		if n == 0 {
-			break
+		if n > 0 {
+			if _, err := f.Write(buf[:n]); err != nil {
+				fmt.Printf("写入文件失败: %v\n", err)
+				return
+			}
+			totalRecv += int64(n)
 		}
-		if _, err := f.Write(buf[:n]); err != nil {
-			fmt.Printf("写入文件失败: %v\n", err)
-			return
+		if totalRecv >= fileSize {
+			break // 数据收齐，即使 FIN 丢包也退出
 		}
-		totalRecv += int64(n)
 	}
 
 	// 发送确认
