@@ -91,14 +91,17 @@ func (s *Stream) Read(b []byte) (int, error) {
 			return n, nil
 		}
 
-		// 即将阻塞读时，主动递增 readMaxData 并发送更新
+		// 即将阻塞读时，连续多发几次流控更新提高送达概率
 		if s.readOffset > 0 {
 			s.readMaxData += 65536
 			s.conn.sendMaxStreamData(s.streamID, s.readMaxData)
+			// 高丢包环境下多发两包冗余
+			s.conn.sendMaxStreamData(s.streamID, s.readMaxData)
+			s.conn.sendMaxStreamData(s.streamID, s.readMaxData)
 		}
 
-		// 定时唤醒防止死锁：有 deadline 用 deadline，否则每 500ms
-		wakeDelay := 500 * time.Millisecond
+		// 定时唤醒防止死锁：有 deadline 用 deadline，否则每 100ms
+		wakeDelay := 100 * time.Millisecond
 		if !s.readDeadline.IsZero() {
 			wakeDelay = time.Until(s.readDeadline)
 		}

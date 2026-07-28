@@ -56,8 +56,9 @@ type Connection struct {
 	largestRecvPN protocol.PacketNumber
 
 	// Send queue
-	sendMu  sync.Mutex
-	sendBuf []byte
+	sendMu        sync.Mutex
+	sendBuf       []byte
+	pendingFrames []wire.Frame // 待打包的 ACK/MAX_STREAM_DATA 等控制帧
 
 	// Flow control
 	maxStreamsBidi int64
@@ -702,13 +703,14 @@ func (c *Connection) sendStreamData(streamID protocol.StreamID, offset protocol.
 	return len(frame.Data)
 }
 
-// sendMaxStreamData sends a MAX_STREAM_DATA frame.
+// sendMaxStreamData queues a MAX_STREAM_DATA frame to be packed with the next STREAM frame.
 func (c *Connection) sendMaxStreamData(streamID protocol.StreamID, maxData protocol.ByteCount) {
-	frame := &wire.MaxStreamDataFrame{
+	c.sendMu.Lock()
+	c.pendingFrames = append(c.pendingFrames, &wire.MaxStreamDataFrame{
 		StreamID:          streamID,
 		MaximumStreamData: maxData,
-	}
-	c.sendFrame(frame)
+	})
+	c.sendMu.Unlock()
 }
 
 // sendFrame serializes and sends a frame.
@@ -767,6 +769,19 @@ func (c *Connection) sendFrame(frame wire.Frame) bool {
 		return false
 	}
 
+	// 将待打包的控制帧（ACK、MAX_STREAM_DATA）合并到同一个包中
+	for i, pf := range c.pendingFrames {
+		prevLen := len(c.sendBuf)
+		c.sendBuf, err = pf.Append(c.sendBuf, c.version)
+		if err != nil || len(c.sendBuf) > protocol.MaxPacketBufferSize {
+			// 超出包大小限制，回退并保留后续帧
+			c.sendBuf = c.sendBuf[:prevLen]
+			c.pendingFrames = c.pendingFrames[i:]
+			break
+		}
+	}
+	c.pendingFrames = c.pendingFrames[:0]
+
 	packetSize := int64(len(c.sendBuf))
 
 	// Record for potential retransmission (limit history to last 10K entries)
@@ -791,9 +806,53 @@ func (c *Connection) sendFrame(frame wire.Frame) bool {
 	return true
 }
 
-// MaxPacketSize returns the current maximum packet size.
-func (c *Connection) MaxPacketSize() protocol.ByteCount {
-	return c.maxPacketSize
+// flushPendingFrames sends any queued ACK/MAX_STREAM_DATA frames as a standalone packet.
+func (c *Connection) flushPendingFrames() {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+
+	if len(c.pendingFrames) == 0 || c.closed.Load() {
+		return
+	}
+
+	nextPN := protocol.PacketNumber(c.sendPN.Add(1) - 1)
+	if protocol.PacketNumber(nextPN) > c.largestSentPN {
+		c.largestSentPN = protocol.PacketNumber(nextPN)
+	}
+	pnLen := protocol.PacketNumberLengthForHeader(nextPN, 0)
+
+	c.sendBuf = c.sendBuf[:0]
+	c.sendBuf = wire.AppendShortHeader(c.sendBuf, c.destConnID, nextPN, pnLen)
+
+	for _, pf := range c.pendingFrames {
+		var err error
+		c.sendBuf, err = pf.Append(c.sendBuf, c.version)
+		if err != nil {
+			break
+		}
+	}
+	c.pendingFrames = c.pendingFrames[:0]
+
+	if len(c.sendBuf) == 0 {
+		return
+	}
+
+	packetSize := int64(len(c.sendBuf))
+	c.sendPacketHistory = append(c.sendPacketHistory, sentPacket{
+		pn:             nextPN,
+		data:           append([]byte{}, c.sendBuf...),
+		time:           time.Now(),
+		isAckEliciting: false,
+	})
+	if len(c.sendPacketHistory) > 10000 {
+		c.sendPacketHistory = c.sendPacketHistory[1000:]
+	}
+	c.congestion.OnPacketSent(packetSize)
+
+	_, err := c.conn.WriteTo(c.sendBuf, c.remoteAddr)
+	if err != nil {
+		c.logf("error sending pending frames: %v", err)
+	}
 }
 
 // SetMaxPacketSize updates the maximum packet size (used by MTU discovery).
@@ -924,7 +983,10 @@ func (c *Connection) sendAckIfNeeded() {
 			AckRanges: ranges,
 			DelayTime: now.Sub(c.lastAckTime),
 		}
-		c.sendFrame(frame)
+		// 不直接发送，放入 pendingFrames 等待与 STREAM 帧打包
+		c.sendMu.Lock()
+		c.pendingFrames = append(c.pendingFrames, frame)
+		c.sendMu.Unlock()
 
 		// Reset counters
 		c.ackElicitingSinceLastAck = 0
@@ -932,6 +994,9 @@ func (c *Connection) sendAckIfNeeded() {
 
 		// Clear history (already acked)
 		c.recvPacketHistory = nil
+
+		// 如果没有 STREAM 帧要发，立即刷新 pending 帧
+		c.flushPendingFrames()
 	}
 }
 
