@@ -194,6 +194,11 @@ func (b *BBR) OnPacketLost(largestSentPNSinceLastLoss int64) {
 	b.recoveryPoint = largestSentPNSinceLastLoss
 }
 
+// OnPacketDiscarded decrements bytes in flight (packet lost, not ACKed).
+func (b *BBR) OnPacketDiscarded(bytes int64) {
+	b.bytesInFlight.Add(-bytes)
+}
+
 // OnPacketNeedsRetransmit handles timeout-based retransmit.
 func (b *BBR) OnPacketNeedsRetransmit() {
 	// For timeout, just reduce to minCwnd to avoid burst

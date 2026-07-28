@@ -90,14 +90,12 @@ func (s *Stream) Read(b []byte) (int, error) {
 			return n, nil
 		}
 
-		// 即将阻塞读时，主动发送一次 MAX_STREAM_DATA 更新，
-		// 防止因之前更新包丢失导致客户端写阻塞的死锁
+		// 即将阻塞读时，主动递增 readMaxData 并发送更新。
+		// 若之前 >= 条件发的更新包丢失，客户端仍阻塞写，双方死锁。
+		// 每次阻塞都递增 65536，即使连续丢包也能确保客户端最终收到一个更新的值。
 		if s.readOffset > 0 {
-			newMax := s.readOffset + 65536
-			if newMax > s.readMaxData {
-				s.readMaxData = newMax
-				s.conn.sendMaxStreamData(s.streamID, s.readMaxData)
-			}
+			s.readMaxData += 65536
+			s.conn.sendMaxStreamData(s.streamID, s.readMaxData)
 		}
 
 		// Wait for data
@@ -240,6 +238,11 @@ func (s *Stream) tryFlushPending() {
 		s.readBuf = append(s.readBuf, chunk...)
 		s.readOffset += protocol.ByteCount(len(chunk))
 		delete(s.pending, s.readOffset-protocol.ByteCount(len(chunk)))
+	}
+	// pending 全部拼完后，检查是否有 FIN 待处理
+	if len(s.pending) == 0 && s.pendingFn {
+		s.finRead = true
+		s.pendingFn = false
 	}
 }
 

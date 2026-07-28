@@ -15,6 +15,10 @@ type Controller interface {
 	// OnPacketLost signals packet loss detected.
 	OnPacketLost(largestSentPNSinceLastLoss int64)
 
+	// OnPacketDiscarded decrements bytes in flight when a packet is
+	// removed from flight (e.g. detected as lost) without ACK side effects.
+	OnPacketDiscarded(bytes int64)
+
 	// OnPacketNeedsRetransmit signals a timeout-based retransmit.
 	OnPacketNeedsRetransmit()
 

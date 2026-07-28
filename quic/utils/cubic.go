@@ -196,6 +196,11 @@ func (c *Cubic) OnPacketLost(largestSentPNSinceLastLoss int64) {
 	c.ackedBytesSinceLoss = 0
 }
 
+// OnPacketDiscarded decrements bytes in flight (packet lost, not ACKed).
+func (c *Cubic) OnPacketDiscarded(bytes int64) {
+	c.bytesInFlight.Add(-bytes)
+}
+
 // OnPacketNeedsRetransmit handles timeout-based retransmit.
 func (c *Cubic) OnPacketNeedsRetransmit() {
 	c.inRecovery.Store(false)

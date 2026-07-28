@@ -570,10 +570,13 @@ func (c *Connection) handleAckFrame(f *wire.AckFrame) {
 				if time.Since(sp.time) > lossDelay {
 					c.logf("快速重传: pn=%d 超时=%v 已过=%v",
 						sp.pn, lossDelay, time.Since(sp.time))
+					packetSize := int64(len(sp.data))
 					sp.lost = true
 					sp.retransmitted = true
 					c.retransmitQueue = append(c.retransmitQueue, sp)
 					c.congestion.OnPacketLost(int64(c.largestSentPN))
+					// 丢包后递减 bytesInFlight，不触发带宽估算等副作用
+					c.congestion.OnPacketDiscarded(packetSize)
 				}
 			}
 		}

@@ -112,6 +112,11 @@ func (r *NewReno) OnPacketLost(largestSentPNSinceLastLoss int64) {
 	r.cwnd.Store(newSsthresh)
 }
 
+// OnPacketDiscarded decrements bytes in flight (packet lost, not ACKed).
+func (r *NewReno) OnPacketDiscarded(bytes int64) {
+	r.bytesInFlight.Add(-bytes)
+}
+
 // OnPacketNeedsRetransmit handles the case where we need to retransmit (timeout).
 func (r *NewReno) OnPacketNeedsRetransmit() {
 	// For timeout, reset cwnd to minimum
