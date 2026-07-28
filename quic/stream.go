@@ -82,13 +82,6 @@ func (s *Stream) Read(b []byte) (int, error) {
 			n := copy(b, s.readBuf)
 			s.readBuf = s.readBuf[n:]
 			s.readOffset += protocol.ByteCount(n)
-
-			// 流控更新：当对端剩余发送额度不足窗口一半时，增加额度
-			available := s.readMaxData - s.reassemblyOffset
-			if available < 32768 { // < 65536/2
-				s.readMaxData = s.reassemblyOffset + 65536
-				s.conn.sendMaxStreamData(s.streamID, s.readMaxData)
-			}
 			return n, nil
 		}
 
@@ -287,6 +280,13 @@ func (s *Stream) handleStreamData(offset protocol.ByteCount, data []byte, fin bo
 		if fin {
 			s.pendingFn = true
 		}
+	}
+
+	// 参考 quic-go：收到数据即检查流控窗口，而非等 Read() 调用
+	available := s.readMaxData - s.reassemblyOffset
+	if available < 32768 {
+		s.readMaxData = s.reassemblyOffset + 65536
+		s.conn.sendMaxStreamData(s.streamID, s.readMaxData)
 	}
 }
 
