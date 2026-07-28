@@ -598,13 +598,13 @@ func (c *Connection) flushRetransmitQueue() {
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
 
-	// Check congestion window before retransmitting
 	var remaining []sentPacket
 	for _, sp := range c.retransmitQueue {
 		packetSize := int64(len(sp.data))
+		// 正常发送路径已绕过拥塞窗口，重传也必须绕过，否则丢的包永远无法恢复
 		if !c.congestion.CanSend(packetSize) {
-			remaining = append(remaining, sp)
-			continue
+			c.logf("重传拥塞告警: cwnd=%d inFlight=%d, 仍重传 pn=%d",
+				c.congestion.Cwnd(), c.congestion.BytesInFlight(), sp.pn)
 		}
 		_, err := c.conn.WriteTo(sp.data, c.remoteAddr)
 		if err != nil {
