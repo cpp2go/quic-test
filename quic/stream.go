@@ -78,11 +78,21 @@ func (s *Stream) Read(b []byte) (int, error) {
 			s.readOffset += protocol.ByteCount(n)
 
 			// Send MAX_STREAM_DATA update periodically
-			if s.readOffset > s.readMaxData/2 {
+			if s.readOffset >= s.readMaxData/2 {
 				s.readMaxData += 65536
 				s.conn.sendMaxStreamData(s.streamID, s.readMaxData)
 			}
 			return n, nil
+		}
+
+		// 即将阻塞读时，主动发送一次 MAX_STREAM_DATA 更新，
+		// 防止因之前更新包丢失导致客户端写阻塞的死锁
+		if s.readOffset > 0 {
+			newMax := s.readOffset + 65536
+			if newMax > s.readMaxData {
+				s.readMaxData = newMax
+				s.conn.sendMaxStreamData(s.streamID, s.readMaxData)
+			}
 		}
 
 		// Wait for data
