@@ -505,8 +505,8 @@ func (c *Connection) handleStreamFrame(f *wire.StreamFrame) {
 		c.streamsMu.Unlock()
 
 		// Set initial flow control for this stream
-		c.localMaxStreamData[f.StreamID] = 65536
-		c.sendMaxStreamData(f.StreamID, 65536)
+		c.localMaxStreamData[f.StreamID] = 1048576
+		c.sendMaxStreamData(f.StreamID, 1048576)
 
 		// Try to accept
 		select {
@@ -703,7 +703,7 @@ func (c *Connection) sendStreamData(streamID protocol.StreamID, offset protocol.
 	return len(frame.Data)
 }
 
-// sendMaxStreamData queues a MAX_STREAM_DATA frame to be packed with the next STREAM frame.
+// sendMaxStreamData queues a MAX_STREAM_DATA frame and flushes immediately.
 func (c *Connection) sendMaxStreamData(streamID protocol.StreamID, maxData protocol.ByteCount) {
 	c.sendMu.Lock()
 	c.pendingFrames = append(c.pendingFrames, &wire.MaxStreamDataFrame{
@@ -711,6 +711,8 @@ func (c *Connection) sendMaxStreamData(streamID protocol.StreamID, maxData proto
 		MaximumStreamData: maxData,
 	})
 	c.sendMu.Unlock()
+	// 立即刷出，不等下一次 STREAM 帧或 ACK 定时器
+	c.flushPendingFrames()
 }
 
 // sendFrame serializes and sends a frame.

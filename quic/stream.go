@@ -47,8 +47,8 @@ func newStream(streamID protocol.StreamID, conn *Connection) *Stream {
 	s := &Stream{
 		streamID:    streamID,
 		conn:        conn,
-		maxData:     65536, // initial flow control limit
-		readMaxData: 65536, // initial flow control limit
+		maxData:     1048576, // initial flow control limit (1MB)
+		readMaxData: 1048576, // initial flow control limit (1MB)
 		pending:     make(map[protocol.ByteCount][]byte),
 	}
 	s.readCond = sync.NewCond(&s.mu)
@@ -87,7 +87,7 @@ func (s *Stream) Read(b []byte) (int, error) {
 
 		// 阻塞前发送流控更新，每次递增保证重复发送时值不断增大
 		if s.reassemblyOffset > 0 {
-			s.readMaxData += 65536
+			s.readMaxData += 1048576
 			s.conn.sendMaxStreamData(s.streamID, s.readMaxData)
 		}
 
@@ -284,8 +284,8 @@ func (s *Stream) handleStreamData(offset protocol.ByteCount, data []byte, fin bo
 
 	// 参考 quic-go：收到数据即检查流控窗口，而非等 Read() 调用
 	available := s.readMaxData - s.reassemblyOffset
-	if available < 32768 {
-		s.readMaxData = s.reassemblyOffset + 65536
+	if available < 524288 { // 1MB/2
+		s.readMaxData = s.reassemblyOffset + 1048576
 		s.conn.sendMaxStreamData(s.streamID, s.readMaxData)
 	}
 }
