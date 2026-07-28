@@ -44,7 +44,7 @@ const (
 
 	bbrProbeRTTInterval = 10 * time.Second       // refresh min RTT every 10s
 	bbrProbeRTTDuration = 200 * time.Millisecond // drain for 200ms
-	bbrMinPipeCwnd      = 4 * 1200               // minimum cwnd in packets
+	bbrMinPipeCwnd      = 65536                  // minimum cwnd (bytes), 匹配初始流控窗口
 
 	// Bandwidth filter window (number of round trips)
 	bbrBWFilterLen = 10

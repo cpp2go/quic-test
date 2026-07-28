@@ -98,12 +98,20 @@ func (s *Stream) Read(b []byte) (int, error) {
 			s.conn.sendMaxStreamData(s.streamID, s.readMaxData)
 		}
 
+		// 定时重试：每 500ms 唤醒一次重发流控更新
+		retryTimer := time.NewTimer(500 * time.Millisecond)
+		defer retryTimer.Stop()
+		go func() {
+			<-retryTimer.C
+			s.readCond.Broadcast()
+		}()
+
 		// Wait for data
 		if !s.readDeadline.IsZero() {
-			timer := time.NewTimer(time.Until(s.readDeadline))
-			defer timer.Stop()
+			deadlineTimer := time.NewTimer(time.Until(s.readDeadline))
+			defer deadlineTimer.Stop()
 			go func() {
-				<-timer.C
+				<-deadlineTimer.C
 				s.readCond.Broadcast()
 			}()
 		}
