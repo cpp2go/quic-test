@@ -769,13 +769,16 @@ func (c *Connection) sendFrame(frame wire.Frame) bool {
 
 	packetSize := int64(len(c.sendBuf))
 
-	// Record for potential retransmission
+	// Record for potential retransmission (limit history to last 10K entries)
 	c.sendPacketHistory = append(c.sendPacketHistory, sentPacket{
 		pn:             nextPN,
 		data:           append([]byte{}, c.sendBuf...),
 		time:           time.Now(),
 		isAckEliciting: isAckElicitingFrame(frame),
 	})
+	if len(c.sendPacketHistory) > 10000 {
+		c.sendPacketHistory = c.sendPacketHistory[1000:]
+	}
 
 	// Update congestion tracker
 	c.congestion.OnPacketSent(packetSize)
@@ -801,11 +804,6 @@ func (c *Connection) SetMaxPacketSize(size protocol.ByteCount) {
 	if size >= protocol.MinInitialPacketSize {
 		c.maxPacketSize = size
 	}
-}
-
-// estimateFrameLength estimates the wire length of a frame.
-func estimateFrameLength(frame wire.Frame, version protocol.Version) int64 {
-	return int64(frame.Length(version)) + 5 // +5 for short header overhead
 }
 
 // isAckElicitingFrame returns true if the frame should trigger an ACK from the peer.
