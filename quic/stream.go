@@ -34,8 +34,9 @@ type Stream struct {
 	readMaxData protocol.ByteCount // max data remote can send
 
 	// Out-of-order reassembly
-	pending   map[protocol.ByteCount][]byte // offset → data
-	pendingFn bool                          // pending FIN
+	reassemblyOffset protocol.ByteCount            // 下一个期望的 QUIC 流偏移量
+	pending          map[protocol.ByteCount][]byte // offset → data
+	pendingFn        bool                          // pending FIN
 
 	finalSize protocol.ByteCount
 	finRead   bool
@@ -245,13 +246,13 @@ func (s *Stream) SetDeadline(t time.Time) error {
 // tryFlushPending 检查 pending 中是否有可拼接到 readBuf 的数据
 func (s *Stream) tryFlushPending() {
 	for {
-		chunk, ok := s.pending[s.readOffset]
+		chunk, ok := s.pending[s.reassemblyOffset]
 		if !ok {
 			break
 		}
 		s.readBuf = append(s.readBuf, chunk...)
-		s.readOffset += protocol.ByteCount(len(chunk))
-		delete(s.pending, s.readOffset-protocol.ByteCount(len(chunk)))
+		s.reassemblyOffset += protocol.ByteCount(len(chunk))
+		delete(s.pending, s.reassemblyOffset-protocol.ByteCount(len(chunk)))
 	}
 	// pending 全部拼完后，检查是否有 FIN 待处理
 	if len(s.pending) == 0 && s.pendingFn {
@@ -269,9 +270,9 @@ func (s *Stream) handleStreamData(offset protocol.ByteCount, data []byte, fin bo
 		return
 	}
 
-	// 丢弃重复/已消耗的数据（重传包会携带相同偏移量的数据）
+	// 丢弃重复/已消费的数据（重传包会携带相同偏移量的数据）
 	end := offset + protocol.ByteCount(len(data))
-	if end <= s.readOffset {
+	if end <= s.reassemblyOffset {
 		if fin {
 			s.tryFlushPending()
 			if len(s.pending) == 0 {
@@ -282,10 +283,10 @@ func (s *Stream) handleStreamData(offset protocol.ByteCount, data []byte, fin bo
 		return
 	}
 
-	if offset == s.readOffset {
+	if offset == s.reassemblyOffset {
 		// 按序到达，直接追加
 		s.readBuf = append(s.readBuf, data...)
-		s.readOffset = end
+		s.reassemblyOffset = end
 		if fin {
 			s.finRead = true
 		}
