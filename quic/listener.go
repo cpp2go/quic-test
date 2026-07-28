@@ -63,6 +63,7 @@ func ListenAddr(addr string, config *Config) (*Listener, error) {
 	if err != nil {
 		return nil, err
 	}
+	setUDPBuffer(conn)
 	return Listen(conn, config), nil
 }
 
@@ -150,7 +151,7 @@ func (l *Listener) Addrs() []net.Addr {
 
 // readLoop reads UDP packets from a socket and dispatches them.
 func (l *Listener) readLoop(conn *net.UDPConn) {
-	buf := make([]byte, protocol.MaxPacketBufferSize*2)
+	buf := make([]byte, 65536) // 64KB，足够接收任何合法 QUIC 包
 
 	for {
 		select {
@@ -379,6 +380,7 @@ func dialOne(ctx context.Context, addr string, config *Config) (*Connection, err
 	if err != nil {
 		return nil, err
 	}
+	setUDPBuffer(udpConn)
 
 	if config == nil {
 		config = DefaultConfig()
@@ -416,4 +418,18 @@ func dialOne(ctx context.Context, addr string, config *Config) (*Connection, err
 	}
 
 	return conn, nil
+}
+
+// setUDPBuffer 设置 UDP 内核收发缓冲区（参考 quic-go 的 7MB）
+func setUDPBuffer(conn *net.UDPConn) {
+	const bufSize = 7 * 1024 * 1024
+	if raw, err := conn.SyscallConn(); err == nil {
+		raw.Control(func(fd uintptr) {
+			_ = conn.SetReadBuffer(bufSize)
+			_ = conn.SetWriteBuffer(bufSize)
+		})
+	} else {
+		_ = conn.SetReadBuffer(bufSize)
+		_ = conn.SetWriteBuffer(bufSize)
+	}
 }

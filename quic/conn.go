@@ -199,7 +199,7 @@ func newClientConnection(conn net.PacketConn, remoteAddr net.Addr, destConnID, s
 // startReadLoop reads UDP packets and feeds them to the connection's packet handler.
 // This is used for client connections that own their own UDP socket.
 func (c *Connection) startReadLoop() {
-	buf := make([]byte, protocol.MaxPacketBufferSize*2)
+	buf := make([]byte, 65536) // 64KB，足够接收任何合法 QUIC 包
 	for {
 		select {
 		case <-c.done:
@@ -216,8 +216,8 @@ func (c *Connection) startReadLoop() {
 			case <-c.done:
 				return
 			default:
-				c.logf("read error: %v", err)
-				return
+				c.logf("read error: %v (continuing)", err)
+				continue // 不退出，重试
 			}
 		}
 		data := make([]byte, n)
@@ -769,11 +769,12 @@ func (c *Connection) sendFrame(frame wire.Frame) bool {
 		return false
 	}
 
-	// 将待打包的控制帧（ACK、MAX_STREAM_DATA）合并到同一个包中
+	// 将待打包的控制帧（ACK、MAX_STREAM_DATA）合并到同一个包中，不超过 MTU
+	mtuLimit := int(c.maxPacketSize)
 	for i, pf := range c.pendingFrames {
 		prevLen := len(c.sendBuf)
 		c.sendBuf, err = pf.Append(c.sendBuf, c.version)
-		if err != nil || len(c.sendBuf) > protocol.MaxPacketBufferSize {
+		if err != nil || len(c.sendBuf) > mtuLimit {
 			// 超出包大小限制，回退并保留后续帧
 			c.sendBuf = c.sendBuf[:prevLen]
 			c.pendingFrames = c.pendingFrames[i:]
@@ -824,10 +825,13 @@ func (c *Connection) flushPendingFrames() {
 	c.sendBuf = c.sendBuf[:0]
 	c.sendBuf = wire.AppendShortHeader(c.sendBuf, c.destConnID, nextPN, pnLen)
 
+	mtuLimit := int(c.maxPacketSize)
 	for _, pf := range c.pendingFrames {
+		prevLen := len(c.sendBuf)
 		var err error
 		c.sendBuf, err = pf.Append(c.sendBuf, c.version)
-		if err != nil {
+		if err != nil || len(c.sendBuf) > mtuLimit {
+			c.sendBuf = c.sendBuf[:prevLen]
 			break
 		}
 	}

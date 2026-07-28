@@ -83,20 +83,18 @@ func (s *Stream) Read(b []byte) (int, error) {
 			s.readBuf = s.readBuf[n:]
 			s.readOffset += protocol.ByteCount(n)
 
-			// Send MAX_STREAM_DATA update periodically
-			if s.readOffset >= s.readMaxData/2 {
-				s.readMaxData += 65536
+			// 流控更新：当对端剩余发送额度不足窗口一半时，增加额度
+			available := s.readMaxData - s.reassemblyOffset
+			if available < 32768 { // < 65536/2
+				s.readMaxData = s.reassemblyOffset + 65536
 				s.conn.sendMaxStreamData(s.streamID, s.readMaxData)
 			}
 			return n, nil
 		}
 
-		// 即将阻塞读时，连续多发几次流控更新提高送达概率
-		if s.readOffset > 0 {
-			s.readMaxData += 65536
-			s.conn.sendMaxStreamData(s.streamID, s.readMaxData)
-			// 高丢包环境下多发两包冗余
-			s.conn.sendMaxStreamData(s.streamID, s.readMaxData)
+		// 阻塞前发送一次流控更新（多帧打包+100ms定时器已提供冗余，不再多发）
+		if s.reassemblyOffset > 0 {
+			s.readMaxData = s.reassemblyOffset + 65536
 			s.conn.sendMaxStreamData(s.streamID, s.readMaxData)
 		}
 
