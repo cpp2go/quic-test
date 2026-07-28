@@ -93,6 +93,9 @@ type BBR struct {
 	// Bytes in flight
 	bytesInFlight atomic.Int64
 
+	// Pacing
+	lastSendTime time.Time // 上次发送时间，用于节奏控制
+
 	// ProbeBW gain cycle
 	probeCycleIdx int
 
@@ -210,7 +213,20 @@ func (b *BBR) OnPacketNeedsRetransmit() {
 // CanSend checks if a packet of the given size can be sent.
 // Uses pacing rate (time-based) and cwnd (window-based).
 func (b *BBR) CanSend(bytes int64) bool {
-	return b.bytesInFlight.Load()+bytes <= b.cwnd
+	// Window check
+	if b.bytesInFlight.Load()+bytes > b.cwnd {
+		return false
+	}
+	// Pacing check: ensure bursts don't exceed pacingRate
+	if b.pacingRate > 0 {
+		interval := time.Duration(float64(bytes) / b.pacingRate * float64(time.Second))
+		nextAllowed := b.lastSendTime.Add(interval)
+		if time.Now().Before(nextAllowed) {
+			return false
+		}
+		b.lastSendTime = time.Now().Add(interval)
+	}
+	return true
 }
 
 // Cwnd returns the congestion window.

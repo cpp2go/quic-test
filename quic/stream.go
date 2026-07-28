@@ -167,7 +167,7 @@ func (s *Stream) Write(b []byte) (int, error) {
 		}
 		s.mu.Unlock()
 		written += actualSent
-		// 拥塞窗口满时短暂等待 ACK 到来释放窗口
+		// 拥塞窗口满时等待，正常发送时也加小间隔防止突发丢包
 		if actualSent == 0 {
 			time.Sleep(time.Millisecond)
 		}
