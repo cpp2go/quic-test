@@ -113,6 +113,7 @@ type Connection struct {
 
 	// PTO state
 	lastRecvAckTime time.Time // last time we received an ACK from peer
+	ptoCount        int       // number of consecutive PTOs without receiving an ACK
 
 	// Loss detection
 	largestSentPN  protocol.PacketNumber
@@ -567,6 +568,7 @@ func (c *Connection) handleAckFrame(f *wire.AckFrame) {
 
 	c.historyMu.Lock()
 	c.lastRecvAckTime = now
+	c.ptoCount = 0 // reset PTO counter on ACK
 
 	// Track largest ACKed PN
 	if largestAcked > c.largestAckedPN {
@@ -951,12 +953,16 @@ func (c *Connection) SetMaxPacketSize(size protocol.ByteCount) {
 func (c *Connection) checkPTO() {
 	c.historyMu.Lock()
 	lastAck := c.lastRecvAckTime
+	ptoCount := c.ptoCount
+	if len(c.sendPacketHistory) == 0 && ptoCount == 0 {
+		c.historyMu.Unlock()
+		return
+	}
 	c.historyMu.Unlock()
 
 	if lastAck.IsZero() {
 		return
 	}
-	// PTO = 3 * smoothed RTT, but at least 200ms
 	pto := c.rttStats.PTO()
 	if pto < 200*time.Millisecond {
 		pto = 200 * time.Millisecond
@@ -965,13 +971,17 @@ func (c *Connection) checkPTO() {
 		return
 	}
 
-	c.historyMu.Lock()
-	if len(c.sendPacketHistory) == 0 {
-		c.historyMu.Unlock()
+	// Max PTO retries before giving up (RFC 9000: close after anti-deadlock timeout)
+	const maxPTOCount = 5
+	if ptoCount >= maxPTOCount {
+		c.logf("PTO 重试达上限 (%d次), 关闭连接", ptoCount)
+		c.CloseWithError(protocol.ErrCode(1), "no response from peer")
 		return
 	}
 
-	c.logf("PTO 触发: 超时=%v, 重置拥塞状态, 未确认包=%d", time.Since(lastAck), len(c.sendPacketHistory))
+	c.historyMu.Lock()
+	c.ptoCount++
+	c.logf("PTO 触发 #%d: 超时=%v, 重置拥塞状态, 未确认包=%d", c.ptoCount, time.Since(lastAck), len(c.sendPacketHistory))
 	c.congestion.OnPacketNeedsRetransmit()
 
 	// Retransmit all outstanding packets
