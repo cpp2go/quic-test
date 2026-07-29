@@ -297,14 +297,19 @@ func downloadFile(remoteName, savePath string, serverAddrs []string) error {
 		if err != nil {
 			return fmt.Errorf("接收数据失败: %w", err)
 		}
-		if n == 0 {
+		if n > 0 {
+			if _, err := f.Write(buf[:n]); err != nil {
+				return fmt.Errorf("写入文件失败: %w", err)
+			}
+			totalRecv += int64(n)
+		}
+		// 数据收齐即退出，不等 FIN（FIN 可能在丢包路径上丢失）
+		if totalRecv >= fileSize {
 			break
 		}
-		if _, err := f.Write(buf[:n]); err != nil {
-			return fmt.Errorf("写入文件失败: %w", err)
-		}
-		totalRecv += int64(n)
 	}
+
+	progressTicker.Stop()
 
 	elapsed := time.Since(start)
 	speed := float64(totalRecv) / elapsed.Seconds()
