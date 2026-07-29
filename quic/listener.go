@@ -175,7 +175,7 @@ func (l *Listener) readLoop(conn *net.UDPConn) {
 			}
 		}
 
-		data := make([]byte, n)
+		data := poolGetRecvBuf(n)
 		copy(data, buf[:n])
 		go l.dispatchPacket(data, remoteAddr)
 	}

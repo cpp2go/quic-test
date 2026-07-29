@@ -42,6 +42,17 @@ const DefaultActiveConnectionIDLimit = 2
 // DefaultMaxAckDelay is the default max ACK delay.
 const DefaultMaxAckDelay = 25 // milliseconds
 
+// MaxCongestionWindowPackets is the maximum congestion window in packets.
+const MaxCongestionWindowPackets = 2000
+
+// MaxOutstandingSentPackets is maximum number of outstanding packets saved for retransmission.
+// When reached, only ACKs and retransmissions are allowed (no new data).
+const MaxOutstandingSentPackets = 2 * MaxCongestionWindowPackets
+
+// MaxTrackedSentPackets is the absolute maximum number of tracked sent packets.
+// When reached, no more packets will be sent.
+const MaxTrackedSentPackets = MaxOutstandingSentPackets * 5 / 4
+
 // ConnectionID is a QUIC connection ID.
 type ConnectionID struct {
 	b [20]byte

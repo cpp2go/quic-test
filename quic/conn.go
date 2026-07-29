@@ -15,6 +15,34 @@ import (
 	"quic-test/quic/wire"
 )
 
+// Buffer pools for receive and send packet copies.
+var (
+	recvBufPool = sync.Pool{
+		New: func() any {
+			return make([]byte, 65536)
+		},
+	}
+	sentPacketPool = sync.Pool{
+		New: func() any {
+			return &sentPacket{}
+		},
+	}
+)
+
+// poolGetRecvBuf returns a buffer from the receive pool, guaranteed to have at least n capacity.
+func poolGetRecvBuf(n int) []byte {
+	b := recvBufPool.Get().([]byte)
+	if cap(b) < n {
+		return make([]byte, n)
+	}
+	return b[:n]
+}
+
+// poolPutRecvBuf returns a receive buffer to the pool.
+func poolPutRecvBuf(b []byte) {
+	recvBufPool.Put(b[:cap(b)])
+}
+
 // ConnectionState holds information about the QUIC connection.
 type ConnectionState struct {
 	Version           protocol.Version
@@ -105,7 +133,8 @@ type Connection struct {
 
 type sentPacket struct {
 	pn             protocol.PacketNumber
-	data           []byte
+	buf            [protocol.MaxPacketBufferSize]byte
+	dataLen        int
 	time           time.Time
 	isAckEliciting bool
 	acked          bool // 已被对端 ACK
@@ -222,7 +251,7 @@ func (c *Connection) startReadLoop() {
 				continue // 不退出，重试
 			}
 		}
-		data := make([]byte, n)
+		data := poolGetRecvBuf(n)
 		copy(data, buf[:n])
 		c.handlePacket(data)
 	}
@@ -359,6 +388,7 @@ func (c *Connection) run() {
 		select {
 		case data := <-c.packetCh:
 			c.handleReceivedPacket(data)
+			poolPutRecvBuf(data)
 		case <-c.immediateAckCh:
 			c.sendAckIfNeeded()
 		case <-ackTicker.C:
@@ -375,6 +405,7 @@ func (c *Connection) handlePacket(data []byte) {
 	case c.packetCh <- data:
 	default:
 		c.logf("packet channel full, dropping packet (%d bytes)", len(data))
+		poolPutRecvBuf(data)
 	}
 }
 
@@ -546,7 +577,7 @@ func (c *Connection) handleAckFrame(f *wire.AckFrame) {
 			if !ok || sp.acked {
 				continue
 			}
-			packetSize := int64(len(sp.data))
+			packetSize := int64(sp.dataLen)
 			// 丢包重传被 ACK：OnPacketDiscarded 已递减过 inFlight，
 			// 先补回 +N 再 OnPacketAcked(-N) = 净值 0，避免二次递减
 			if sp.lost {
@@ -566,7 +597,7 @@ func (c *Connection) handleAckFrame(f *wire.AckFrame) {
 		if sp.isAckEliciting && time.Since(sp.time) > lossDelay {
 			c.logf("快速重传: pn=%d 超时=%v 已过=%v",
 				sp.pn, lossDelay, time.Since(sp.time))
-			packetSize := int64(len(sp.data))
+			packetSize := int64(sp.dataLen)
 			sp.retransmitted = true
 			c.retransmitQueue = append(c.retransmitQueue, *sp)
 			c.congestion.OnPacketLost(int64(c.largestSentPN))
@@ -578,18 +609,8 @@ func (c *Connection) handleAckFrame(f *wire.AckFrame) {
 		}
 	}
 
-	// Compact history periodically (keep last 8000 entries, only remove acked)
-	if len(c.sendPacketHistory) > 12000 {
-		var keep []*sentPacket
-		for _, sp := range c.sendPacketHistory {
-			if sp.acked {
-				delete(c.sendPacketMap, sp.pn)
-			} else {
-				keep = append(keep, sp)
-			}
-		}
-		c.sendPacketHistory = keep
-	}
+	// Compact history: remove all acked entries (quic-go style — compact on every ACK)
+	c.compactSentHistory()
 
 	c.historyMu.Unlock()
 
@@ -608,13 +629,13 @@ func (c *Connection) flushRetransmitQueue() {
 
 	var remaining []sentPacket
 	for _, sp := range c.retransmitQueue {
-		packetSize := int64(len(sp.data))
+		packetSize := int64(sp.dataLen)
 		// 正常发送路径已绕过拥塞窗口，重传也必须绕过，否则丢的包永远无法恢复
 		if !c.congestion.CanSend(packetSize) {
 			c.logf("重传拥塞告警: cwnd=%d inFlight=%d, 仍重传 pn=%d",
 				c.congestion.Cwnd(), c.congestion.BytesInFlight(), sp.pn)
 		}
-		_, err := c.conn.WriteTo(sp.data, c.remoteAddr)
+		_, err := c.conn.WriteTo(sp.buf[:sp.dataLen], c.remoteAddr)
 		if err != nil {
 			c.logf("重传错误 pn=%d: %v", sp.pn, err)
 			remaining = append(remaining, sp)
@@ -733,6 +754,18 @@ func (c *Connection) sendFrame(frame wire.Frame) bool {
 		return false
 	}
 
+	c.historyMu.Lock()
+	trackedCount := len(c.sendPacketHistory)
+	c.historyMu.Unlock()
+
+	// quic-go style: refuse new data when tracked packets exceed limit (RFC 9000 §13.2.3)
+	if _, isStream := frame.(*wire.StreamFrame); isStream && trackedCount >= protocol.MaxOutstandingSentPackets {
+		return false
+	}
+	if trackedCount >= protocol.MaxTrackedSentPackets {
+		return false
+	}
+
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
 
@@ -799,22 +832,18 @@ func (c *Connection) sendFrame(frame wire.Frame) bool {
 	packetSize := int64(len(c.sendBuf))
 
 	// Record for potential retransmission (limit history to last 10K entries)
-	sp := &sentPacket{
-		pn:             nextPN,
-		data:           append([]byte{}, c.sendBuf...),
-		time:           time.Now(),
-		isAckEliciting: isAckElicitingFrame(frame),
-	}
+	sp := sentPacketPool.Get().(*sentPacket)
+	sp.pn = nextPN
+	copy(sp.buf[:], c.sendBuf)
+	sp.dataLen = len(c.sendBuf)
+	sp.time = time.Now()
+	sp.isAckEliciting = isAckElicitingFrame(frame)
+	sp.acked = false
+	sp.lost = false
+	sp.retransmitted = false
 	c.historyMu.Lock()
 	c.sendPacketHistory = append(c.sendPacketHistory, sp)
 	c.sendPacketMap[nextPN] = sp
-	if len(c.sendPacketHistory) > 10000 {
-		// 清理旧 map 条目
-		for _, old := range c.sendPacketHistory[:1000] {
-			delete(c.sendPacketMap, old.pn)
-		}
-		c.sendPacketHistory = c.sendPacketHistory[1000:]
-	}
 	c.historyMu.Unlock()
 
 	// Update congestion tracker
@@ -878,6 +907,25 @@ func (c *Connection) SetMaxPacketSize(size protocol.ByteCount) {
 	if size >= protocol.MinInitialPacketSize {
 		c.maxPacketSize = size
 	}
+}
+
+// compactSentHistory removes all acked entries from sendPacketHistory and sendPacketMap,
+// returning their packet structs to the pool. Called after every ACK (quic-go style).
+func (c *Connection) compactSentHistory() {
+	if len(c.sendPacketHistory) == 0 {
+		return
+	}
+	n := 0
+	for _, sp := range c.sendPacketHistory {
+		if sp.acked {
+			delete(c.sendPacketMap, sp.pn)
+			sentPacketPool.Put(sp)
+		} else {
+			c.sendPacketHistory[n] = sp
+			n++
+		}
+	}
+	c.sendPacketHistory = c.sendPacketHistory[:n]
 }
 
 // isAckElicitingFrame returns true if the frame should trigger an ACK from the peer.
@@ -945,11 +993,15 @@ func (c *Connection) sendInitialPacket(frame wire.Frame) {
 	}
 
 	// Record
-	sp := &sentPacket{
-		pn:   nextPN,
-		data: append([]byte{}, c.sendBuf...),
-		time: time.Now(),
-	}
+	sp := sentPacketPool.Get().(*sentPacket)
+	sp.pn = nextPN
+	copy(sp.buf[:], c.sendBuf)
+	sp.dataLen = len(c.sendBuf)
+	sp.time = time.Now()
+	sp.isAckEliciting = false
+	sp.acked = false
+	sp.lost = false
+	sp.retransmitted = false
 	c.historyMu.Lock()
 	c.sendPacketHistory = append(c.sendPacketHistory, sp)
 	c.sendPacketMap[nextPN] = sp

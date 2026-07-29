@@ -128,8 +128,8 @@ func (s *Stream) Write(b []byte) (int, error) {
 	for written < len(b) {
 		chunkSize := len(b) - written
 		// 用 MTU 上限 - 包头开销，减少分包数
-		if chunkSize > 1200 {
-			chunkSize = 1200
+		if chunkSize > int(protocol.MinInitialPacketSize) {
+			chunkSize = int(protocol.MinInitialPacketSize)
 		}
 
 		s.mu.Lock()
