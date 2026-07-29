@@ -991,12 +991,15 @@ func (c *Connection) sendAckIfNeeded() {
 		c.pendingFrames = append(c.pendingFrames, frame)
 		c.sendMu.Unlock()
 
-		// Reset counters
+		// Reset counters but keep history — server needs ACKs to detect loss even
+		// when no new packets arrive. Otherwise client stops ACKing → deadlock.
 		c.ackElicitingSinceLastAck = 0
 		c.lastAckTime = now
 
-		// Clear history (already acked)
-		c.recvPacketHistory = nil
+		// Trim history to avoid unbounded growth (keep last 2000 entries)
+		if len(c.recvPacketHistory) > 2000 {
+			c.recvPacketHistory = c.recvPacketHistory[len(c.recvPacketHistory)-1000:]
+		}
 
 		// 如果没有 STREAM 帧要发，立即刷新 pending 帧
 		c.flushPendingFrames()
