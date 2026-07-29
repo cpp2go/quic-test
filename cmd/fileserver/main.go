@@ -168,6 +168,8 @@ func handleUpload(stream *quic.Stream) {
 		}
 	}
 
+	progressTicker.Stop() // 停止进度打印
+
 	// 发送确认
 	ackMsg := fmt.Sprintf("OK: received %s (%d bytes)", safeName, totalRecv)
 	stream.Write([]byte(ackMsg))
