@@ -76,13 +76,14 @@ type BBR struct {
 	// Round tracking
 	roundCount      int64
 	roundStart      bool
-	nextRoundPktNum int64 // packet number to start next round
+	nextRoundPktNum int64 // packet number to start next round (deprecated, using time-based)
 	roundDelivered  int64 // bytes delivered at start of round
 
 	// Per-round bandwidth estimation
 	roundBytesDelivered int64     // bytes delivered in current round
 	roundStartTime      time.Time // when current round started
 	prevRoundBw         float64   // delivery rate from previous round (for bwGrewThisRound)
+	roundEndTime        time.Time // when last round ended (for anti-starvation)
 	packetDelivered     int64     // total bytes delivered so far
 
 	// Delivery rate tracking
@@ -169,24 +170,16 @@ func (b *BBR) OnPacketAcked(ackedBytes int64, packetNumber int64, now time.Time)
 		}
 	}
 
-	// Check for round start
-	if packetNumber >= b.nextRoundPktNum {
-		b.roundStart = true
-		b.nextRoundPktNum = packetNumber + 1
-		b.roundCount++
-
-		// Compute delivery rate for the round that just ended
-		if b.roundBytesDelivered > 0 && !b.roundStartTime.IsZero() {
-			elapsed := now.Sub(b.roundStartTime).Seconds()
-			if elapsed > 0 {
-				rate := float64(b.roundBytesDelivered) / elapsed
-				b.updateBtlBw(rate)
-				b.prevRoundBw = rate
-			}
-		}
-		// Reset for next round
-		b.roundBytesDelivered = 0
-		b.roundStartTime = now
+	// Check for round start (time-based: one round ≈ one rtProp)
+	// 同时也防止长时间无 ACK 导致 round 永远不推进（上限 2*rtProp）
+	roundDuration := b.rtProp
+	maxRoundDuration := 2 * b.rtProp
+	if !b.roundStartTime.IsZero() && now.Sub(b.roundStartTime) > maxRoundDuration {
+		// 强制推进：超过 2 个 rtProp 还没收到足够的 ACK
+		roundDuration = now.Sub(b.roundStartTime)
+		b.startNewRound(now, roundDuration)
+	} else if packetNumber >= b.nextRoundPktNum || now.Sub(b.roundStartTime) >= roundDuration {
+		b.startNewRound(now, roundDuration)
 	}
 
 	// Advance BBR state machine on round start
@@ -197,6 +190,23 @@ func (b *BBR) OnPacketAcked(ackedBytes int64, packetNumber int64, now time.Time)
 	}
 
 	return true
+}
+
+func (b *BBR) startNewRound(now time.Time, roundDuration time.Duration) {
+	b.roundStart = true
+	b.roundCount++
+
+	// Compute delivery rate for the round that just ended
+	if b.roundBytesDelivered > 0 && roundDuration > 0 {
+		rate := float64(b.roundBytesDelivered) / roundDuration.Seconds()
+		b.updateBtlBw(rate)
+		b.prevRoundBw = rate
+	}
+	// Reset for next round; nextRoundPktNum 用作宽松的辅助判定
+	b.roundBytesDelivered = 0
+	b.roundStartTime = now
+	b.roundEndTime = now
+	b.nextRoundPktNum += 1000 // 宽限：大致 1000 个包后无论如何开始新轮
 }
 
 // OnPacketLost handles packet loss.
