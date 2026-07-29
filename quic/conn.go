@@ -70,6 +70,7 @@ type Connection struct {
 	recvPacketHistory        []protocol.PacketNumber
 	sendPacketHistory        []*sentPacket                         // ordered by PN, for loss detection
 	sendPacketMap            map[protocol.PacketNumber]*sentPacket // O(1) lookup
+	historyMu                sync.Mutex                            // protects sendPacketHistory + sendPacketMap
 	ackTimer                 *time.Timer
 	immediateAckCh           chan struct{}
 	ackElicitingSinceLastAck int
@@ -528,6 +529,8 @@ func (c *Connection) handleAckFrame(f *wire.AckFrame) {
 	largestAcked := f.AckRanges[0].Largest
 	now := time.Now()
 
+	c.historyMu.Lock()
+
 	// Track largest ACKed PN
 	if largestAcked > c.largestAckedPN {
 		c.largestAckedPN = largestAcked
@@ -582,7 +585,9 @@ func (c *Connection) handleAckFrame(f *wire.AckFrame) {
 		c.sendPacketHistory = c.sendPacketHistory[cutoff:]
 	}
 
-	// Try to retransmit lost packets
+	c.historyMu.Unlock()
+
+	// Try to retransmit lost packets (must not hold historyMu to avoid deadlock with sendMu)
 	c.flushRetransmitQueue()
 }
 
@@ -787,6 +792,7 @@ func (c *Connection) sendFrame(frame wire.Frame) bool {
 		time:           time.Now(),
 		isAckEliciting: isAckElicitingFrame(frame),
 	}
+	c.historyMu.Lock()
 	c.sendPacketHistory = append(c.sendPacketHistory, sp)
 	c.sendPacketMap[nextPN] = sp
 	if len(c.sendPacketHistory) > 10000 {
@@ -796,6 +802,7 @@ func (c *Connection) sendFrame(frame wire.Frame) bool {
 		}
 		c.sendPacketHistory = c.sendPacketHistory[1000:]
 	}
+	c.historyMu.Unlock()
 
 	// Update congestion tracker
 	c.congestion.OnPacketSent(packetSize)
@@ -930,8 +937,10 @@ func (c *Connection) sendInitialPacket(frame wire.Frame) {
 		data: append([]byte{}, c.sendBuf...),
 		time: time.Now(),
 	}
+	c.historyMu.Lock()
 	c.sendPacketHistory = append(c.sendPacketHistory, sp)
 	c.sendPacketMap[nextPN] = sp
+	c.historyMu.Unlock()
 
 	_, err = c.conn.WriteTo(c.sendBuf, c.remoteAddr)
 	if err != nil {
