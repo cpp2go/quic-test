@@ -77,40 +77,33 @@ type BBR struct {
 	roundCount      int64
 	roundStart      bool
 	nextRoundPktNum int64 // packet number to start next round (deprecated, using time-based)
-	roundDelivered  int64 // bytes delivered at start of round
 
 	// Per-round bandwidth estimation
 	roundBytesDelivered int64     // bytes delivered in current round
 	roundStartTime      time.Time // when current round started
 	prevRoundBw         float64   // delivery rate from previous round (for bwGrewThisRound)
 	roundEndTime        time.Time // when last round ended (for anti-starvation)
-	packetDelivered     int64     // total bytes delivered so far
 
 	// Delivery rate tracking
-	delivered  int64 // cumulative bytes delivered
-	appLimited bool
+	delivered int64 // cumulative bytes delivered
 
 	// Pacing & window
-	pacingRate float64 // bytes/sec
-	cwnd       int64   // congestion window (bytes)
+	pacingRate atomic.Int64 // bytes/sec (stored as int64)
+	cwnd       atomic.Int64 // congestion window (bytes)
 	minCwnd    int64
 
 	// Bytes in flight
 	bytesInFlight atomic.Int64
 
 	// Pacing
-	lastSendTime time.Time // 上次发送时间，用于节奏控制
+	lastSendTime atomic.Int64 // UnixNano, 上次发送时间
 
 	// ProbeBW gain cycle
 	probeCycleIdx int
 
 	// ProbeRTT
-	probeRTTDoneAt     time.Time
-	probeRTTRoundStart int64
-	probeRTTLastState  bbrState
-
-	// Max datagram size (MSS)
-	maxDatagramSize int64
+	probeRTTDoneAt    time.Time
+	probeRTTLastState bbrState
 
 	// Loss recovery
 	inRecovery    atomic.Bool
@@ -124,13 +117,12 @@ type BBR struct {
 // NewBBR creates a BBR congestion controller.
 func NewBBR() *BBR {
 	b := &BBR{
-		state:           bbrStateStartup,
-		rtProp:          333 * time.Millisecond,
-		maxDatagramSize: 1200,
-		minCwnd:         bbrMinPipeCwnd,
+		state:   bbrStateStartup,
+		rtProp:  333 * time.Millisecond,
+		minCwnd: bbrMinPipeCwnd,
 	}
-	b.pacingRate = float64(b.minCwnd) / b.rtProp.Seconds()
-	b.cwnd = b.minCwnd
+	b.pacingRate.Store(int64(float64(b.minCwnd) / b.rtProp.Seconds()))
+	b.cwnd.Store(b.minCwnd)
 	b.enterStartup()
 	return b
 }
@@ -234,8 +226,8 @@ func (b *BBR) OnPacketDiscarded(bytes int64) {
 // OnPacketNeedsRetransmit handles timeout-based retransmit.
 func (b *BBR) OnPacketNeedsRetransmit() {
 	// For timeout, just reduce to minCwnd to avoid burst
-	b.cwnd = b.minCwnd
-	b.pacingRate = float64(b.minCwnd) / b.rtProp.Seconds()
+	b.cwnd.Store(b.minCwnd)
+	b.pacingRate.Store(int64(float64(b.minCwnd) / b.rtProp.Seconds()))
 	b.inRecovery.Store(false)
 }
 
@@ -243,22 +235,23 @@ func (b *BBR) OnPacketNeedsRetransmit() {
 // Uses pacing rate (time-based) and cwnd (window-based).
 func (b *BBR) CanSend(bytes int64) bool {
 	// Window check
-	if b.bytesInFlight.Load()+bytes > b.cwnd {
+	if b.bytesInFlight.Load()+bytes > b.cwnd.Load() {
 		return false
 	}
 	// Pacing check: ensure bursts don't exceed pacingRate
-	if b.pacingRate > 0 {
-		interval := time.Duration(float64(bytes) / b.pacingRate * float64(time.Second))
-		if time.Now().Before(b.lastSendTime.Add(interval)) {
+	if rate := b.pacingRate.Load(); rate > 0 {
+		interval := time.Duration(float64(bytes) / float64(rate) * float64(time.Second))
+		lastTs := time.Unix(0, b.lastSendTime.Load())
+		if time.Now().Before(lastTs.Add(interval)) {
 			return false
 		}
-		b.lastSendTime = time.Now()
+		b.lastSendTime.Store(time.Now().UnixNano())
 	}
 	return true
 }
 
 // Cwnd returns the congestion window.
-func (b *BBR) Cwnd() int64 { return b.cwnd }
+func (b *BBR) Cwnd() int64 { return b.cwnd.Load() }
 
 // BytesInFlight returns the current bytes in flight.
 func (b *BBR) BytesInFlight() int64 { return b.bytesInFlight.Load() }
@@ -267,14 +260,14 @@ func (b *BBR) BytesInFlight() int64 { return b.bytesInFlight.Load() }
 func (b *BBR) InRecovery() bool { return b.inRecovery.Load() }
 
 // PacingRate returns the current pacing rate (bytes/sec).
-func (b *BBR) PacingRate() float64 { return b.pacingRate }
+func (b *BBR) PacingRate() float64 { return float64(b.pacingRate.Load()) }
 
 //=== private ===
 
 func (b *BBR) enterStartup() {
 	b.state = bbrStateStartup
-	b.pacingRate = float64(b.minCwnd) / b.rtProp.Seconds()
-	b.cwnd = b.minCwnd
+	b.pacingRate.Store(int64(float64(b.minCwnd) / b.rtProp.Seconds()))
+	b.cwnd.Store(b.minCwnd)
 }
 
 func (b *BBR) updateBtlBw(rate float64) {
@@ -365,7 +358,7 @@ func (b *BBR) updatePacingAndCwnd() {
 	if rate == 0 {
 		rate = float64(b.minCwnd) / b.rtProp.Seconds()
 	}
-	b.pacingRate = rate
+	b.pacingRate.Store(int64(rate))
 
 	// Cwnd = cwndGain × BDP (or minCwnd, whichever is larger)
 	newCwnd := int64(math.Ceil(cwndGain * bdp))
@@ -375,7 +368,7 @@ func (b *BBR) updatePacingAndCwnd() {
 	if b.state == bbrStateProbeRTT {
 		newCwnd = b.minCwnd
 	}
-	b.cwnd = newCwnd
+	b.cwnd.Store(newCwnd)
 }
 
 func (b *BBR) bdp() float64 {

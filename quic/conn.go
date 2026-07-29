@@ -84,9 +84,8 @@ type Connection struct {
 	retransmitQueue []sentPacket
 
 	// Loss detection
-	largestSentPN       protocol.PacketNumber
-	largestAckedPN      protocol.PacketNumber
-	detectedLostPackets []protocol.PacketNumber
+	largestSentPN  protocol.PacketNumber
+	largestAckedPN protocol.PacketNumber
 
 	// Remote max stream data tracking
 	remoteMaxStreamData map[protocol.StreamID]protocol.ByteCount
@@ -136,7 +135,6 @@ func newServerConnection(conn net.PacketConn, remoteAddr net.Addr, destConnID, s
 		rttStats:            utils.NewRTTStats(),
 		congestion:          newController(cfg),
 		retransmitQueue:     make([]sentPacket, 0),
-		detectedLostPackets: make([]protocol.PacketNumber, 0),
 		remoteMaxStreamData: make(map[protocol.StreamID]protocol.ByteCount),
 		localMaxStreamData:  make(map[protocol.StreamID]protocol.ByteCount),
 		maxPacketSize:       protocol.InitialPacketSize,
@@ -184,7 +182,6 @@ func newClientConnection(conn net.PacketConn, remoteAddr net.Addr, destConnID, s
 		rttStats:            utils.NewRTTStats(),
 		congestion:          newController(cfg),
 		retransmitQueue:     make([]sentPacket, 0),
-		detectedLostPackets: make([]protocol.PacketNumber, 0),
 		remoteMaxStreamData: make(map[protocol.StreamID]protocol.ByteCount),
 		localMaxStreamData:  make(map[protocol.StreamID]protocol.ByteCount),
 		maxPacketSize:       protocol.InitialPacketSize,
