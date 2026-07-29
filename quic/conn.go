@@ -108,8 +108,9 @@ type sentPacket struct {
 	data           []byte
 	time           time.Time
 	isAckEliciting bool
-	lost           bool
-	retransmitted  bool
+	acked          bool // 已被对端 ACK
+	lost           bool // 已检测为丢包（加入重传队列）
+	retransmitted  bool // 已加入重传队列（防止重复入队）
 }
 
 func newServerConnection(conn net.PacketConn, remoteAddr net.Addr, destConnID, srcConnID protocol.ConnectionID, version protocol.Version, cfg *Config) *Connection {
@@ -542,20 +543,21 @@ func (c *Connection) handleAckFrame(f *wire.AckFrame) {
 	for _, ar := range f.AckRanges {
 		for pn := ar.Smallest; pn <= ar.Largest; pn++ {
 			sp, ok := c.sendPacketMap[pn]
-			if !ok || sp.lost {
+			if !ok || sp.acked {
 				continue
 			}
 			packetSize := int64(len(sp.data))
 			c.congestion.OnPacketAcked(packetSize, int64(sp.pn), now)
-			sp.lost = true // mark as acked (reuse lost flag for "processed")
+			sp.acked = true
 		}
 	}
 
 	// Loss detection: only scan history once per ACK, use pre-computed lossDelay
 	// Slice 按 PN 有序，超过 largestAcked 即可停止
+	// 不跳过 lost && !retransmitted（重传后可能再次丢包）
 	lossDelay := c.rttStats.LossDelay()
 	for _, sp := range c.sendPacketHistory {
-		if sp.lost || sp.retransmitted {
+		if sp.acked || sp.retransmitted {
 			continue
 		}
 		if sp.pn >= largestAcked {
@@ -565,21 +567,28 @@ func (c *Connection) handleAckFrame(f *wire.AckFrame) {
 			c.logf("快速重传: pn=%d 超时=%v 已过=%v",
 				sp.pn, lossDelay, time.Since(sp.time))
 			packetSize := int64(len(sp.data))
-			sp.lost = true
 			sp.retransmitted = true
 			c.retransmitQueue = append(c.retransmitQueue, *sp)
 			c.congestion.OnPacketLost(int64(c.largestSentPN))
-			c.congestion.OnPacketDiscarded(packetSize)
+			// OnPacketDiscarded 只首次丢包时调用一次
+			if !sp.lost {
+				sp.lost = true
+				c.congestion.OnPacketDiscarded(packetSize)
+			}
 		}
 	}
 
-	// Compact history periodically (keep last 8000 unprocessed entries)
+	// Compact history periodically (keep last 8000 entries, only remove acked)
 	if len(c.sendPacketHistory) > 12000 {
-		cutoff := len(c.sendPacketHistory) - 8000
-		for _, old := range c.sendPacketHistory[:cutoff] {
-			delete(c.sendPacketMap, old.pn)
+		var keep []*sentPacket
+		for _, sp := range c.sendPacketHistory {
+			if sp.acked {
+				delete(c.sendPacketMap, sp.pn)
+			} else {
+				keep = append(keep, sp)
+			}
 		}
-		c.sendPacketHistory = c.sendPacketHistory[cutoff:]
+		c.sendPacketHistory = keep
 	}
 
 	c.historyMu.Unlock()
@@ -611,6 +620,13 @@ func (c *Connection) flushRetransmitQueue() {
 			remaining = append(remaining, sp)
 		} else {
 			c.logf("重传 pn=%d 成功", sp.pn)
+			// 更新原始条目：重置时间以便再次丢包时能重新检测
+			c.historyMu.Lock()
+			if orig, ok := c.sendPacketMap[sp.pn]; ok {
+				orig.time = time.Now()
+				orig.retransmitted = false // 允许再次检测丢包
+			}
+			c.historyMu.Unlock()
 		}
 	}
 	c.retransmitQueue = remaining
