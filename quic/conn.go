@@ -98,8 +98,6 @@ type Connection struct {
 
 	// Current max packet size (starts at InitialPacketSize, may increase via MTU discovery)
 	maxPacketSize protocol.ByteCount
-	// 上次成功发出的时间，用于检测死锁
-	lastSendTime time.Time
 
 	logf func(format string, args ...interface{})
 }
@@ -747,31 +745,12 @@ func (c *Connection) sendFrame(frame wire.Frame) bool {
 			sf.DataLenPresent = true
 		}
 
-		// STREAM 帧遵守拥塞窗口，避免网络过载
+		// STREAM 帧遵守拥塞窗口，避免网络过载导致控制帧也一起丢失
 		if !c.congestion.CanSend(int64(len(sf.Data))) {
-			// PTO 探测：长时间无 ACK 时强制发送小包触发对端回 ACK（参考 quic-go）
-			if !c.lastSendTime.IsZero() {
-				ptoTimeout := c.rttStats.PTO() * 2 // PTO 指数退避
-				if ptoTimeout < 200*time.Millisecond {
-					ptoTimeout = 200 * time.Millisecond
-				}
-				if time.Since(c.lastSendTime) > ptoTimeout {
-					sf.Data = sf.Data[:min(len(sf.Data), 512)] // 只发 512B 探测
-					sf.DataLenPresent = true
-					// 探测包不计入 cwnd，重置 lastSendTime 避免连续探测
-					c.lastSendTime = time.Time{}
-				} else {
-					sf.Data = nil
-					return false
-				}
-			} else {
-				sf.Data = nil
-				return false
-			}
+			sf.Data = nil // 标记未发送，调用方会重试
+			return false
 		}
 	}
-
-	c.lastSendTime = time.Now()
 
 	// Build packet
 	nextPN := protocol.PacketNumber(c.sendPN.Add(1) - 1)
@@ -864,18 +843,8 @@ func (c *Connection) flushPendingFrames() {
 		return
 	}
 
-	packetSize := int64(len(c.sendBuf))
-	c.sendPacketHistory = append(c.sendPacketHistory, sentPacket{
-		pn:             nextPN,
-		data:           append([]byte{}, c.sendBuf...),
-		time:           time.Now(),
-		isAckEliciting: false,
-	})
-	if len(c.sendPacketHistory) > 10000 {
-		c.sendPacketHistory = c.sendPacketHistory[1000:]
-	}
-	c.congestion.OnPacketSent(packetSize)
-
+	// 纯控制帧包不计入拥塞控制（ACK/MAX_STREAM_DATA 不会被对端 ACK，
+	// 计入 bytesInFlight 后永远不会递减，导致 cwnd 永久膨胀）
 	_, err := c.conn.WriteTo(c.sendBuf, c.remoteAddr)
 	if err != nil {
 		c.logf("error sending pending frames: %v", err)
