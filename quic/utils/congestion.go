@@ -130,7 +130,13 @@ func (r *NewReno) OnPacketNeedsRetransmit() {
 
 // CanSend checks if we can send a packet of the given size.
 func (r *NewReno) CanSend(bytes int64) bool {
-	return r.bytesInFlight.Load()+bytes <= r.cwnd.Load()
+	inFlight := r.bytesInFlight.Load()
+	cwnd := r.cwnd.Load()
+	// During recovery, allow one extra MSS to probe for ACKs and exit recovery
+	if r.inRecovery.Load() {
+		return inFlight+bytes <= cwnd+r.maxDatagramSize
+	}
+	return inFlight+bytes <= cwnd
 }
 
 // Cwnd returns the current congestion window.

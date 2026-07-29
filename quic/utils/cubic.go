@@ -224,7 +224,12 @@ func (c *Cubic) OnPacketNeedsRetransmit() {
 
 // CanSend checks if a packet of the given size can be sent.
 func (c *Cubic) CanSend(bytes int64) bool {
-	return c.bytesInFlight.Load()+bytes <= c.cwnd.Load()
+	inFlight := c.bytesInFlight.Load()
+	cwnd := c.cwnd.Load()
+	if c.inRecovery.Load() {
+		return inFlight+bytes <= cwnd+c.maxDatagramSize
+	}
+	return inFlight+bytes <= cwnd
 }
 
 // Cwnd returns the congestion window.

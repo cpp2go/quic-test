@@ -111,6 +111,9 @@ type Connection struct {
 	// Retransmit queue
 	retransmitQueue []sentPacket
 
+	// PTO state
+	lastRecvAckTime time.Time // last time we received an ACK from peer
+
 	// Loss detection
 	largestSentPN  protocol.PacketNumber
 	largestAckedPN protocol.PacketNumber
@@ -383,6 +386,8 @@ func (c *Connection) getCloseErr() error {
 func (c *Connection) run() {
 	ackTicker := time.NewTicker(25 * time.Millisecond)
 	defer ackTicker.Stop()
+	ptoTicker := time.NewTicker(100 * time.Millisecond)
+	defer ptoTicker.Stop()
 
 	for {
 		select {
@@ -393,6 +398,8 @@ func (c *Connection) run() {
 			c.sendAckIfNeeded()
 		case <-ackTicker.C:
 			c.sendAckIfNeeded()
+		case <-ptoTicker.C:
+			c.checkPTO()
 		case <-c.done:
 			return
 		}
@@ -559,6 +566,7 @@ func (c *Connection) handleAckFrame(f *wire.AckFrame) {
 	now := time.Now()
 
 	c.historyMu.Lock()
+	c.lastRecvAckTime = now
 
 	// Track largest ACKed PN
 	if largestAcked > c.largestAckedPN {
@@ -905,6 +913,51 @@ func (c *Connection) SetMaxPacketSize(size protocol.ByteCount) {
 	if size >= protocol.MinInitialPacketSize {
 		c.maxPacketSize = size
 	}
+}
+
+// checkPTO checks if we haven't received an ACK for too long and resets congestion state.
+func (c *Connection) checkPTO() {
+	c.historyMu.Lock()
+	lastAck := c.lastRecvAckTime
+	c.historyMu.Unlock()
+
+	if lastAck.IsZero() {
+		return
+	}
+	// PTO = 3 * smoothed RTT, but at least 200ms
+	pto := c.rttStats.PTO()
+	if pto < 200*time.Millisecond {
+		pto = 200 * time.Millisecond
+	}
+	if time.Since(lastAck) < pto {
+		return
+	}
+
+	c.historyMu.Lock()
+	if len(c.sendPacketHistory) == 0 {
+		c.historyMu.Unlock()
+		return
+	}
+
+	c.logf("PTO 触发: 超时=%v, 重置拥塞状态, 未确认包=%d", time.Since(lastAck), len(c.sendPacketHistory))
+	c.congestion.OnPacketNeedsRetransmit()
+
+	// Retransmit all outstanding packets
+	for _, sp := range c.sendPacketHistory {
+		if sp.acked || sp.retransmitted {
+			continue
+		}
+		sp.retransmitted = true
+		c.retransmitQueue = append(c.retransmitQueue, *sp)
+		if !sp.lost {
+			sp.lost = true
+			c.congestion.OnPacketDiscarded(int64(sp.dataLen))
+		}
+	}
+	c.lastRecvAckTime = time.Now() // reset timer
+	c.historyMu.Unlock()
+
+	c.flushRetransmitQueue()
 }
 
 // compactSentHistory removes all acked entries from sendPacketHistory and sendPacketMap,
