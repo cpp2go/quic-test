@@ -557,16 +557,11 @@ func (c *Connection) handleAckFrame(f *wire.AckFrame) {
 		}
 	}
 
-	// Loss detection: only scan history once per ACK, use pre-computed lossDelay
-	// Slice 按 PN 有序，超过 largestAcked 即可停止
-	// 不跳过 lost && !retransmitted（重传后可能再次丢包）
+	// Loss detection: 所有超时包都检测丢包，不因 PN > largestAcked 跳过
 	lossDelay := c.rttStats.LossDelay()
 	for _, sp := range c.sendPacketHistory {
 		if sp.acked || sp.retransmitted {
 			continue
-		}
-		if sp.pn >= largestAcked {
-			break // 后面的 PN 更大，无需继续
 		}
 		if sp.isAckEliciting && time.Since(sp.time) > lossDelay {
 			c.logf("快速重传: pn=%d 超时=%v 已过=%v",
