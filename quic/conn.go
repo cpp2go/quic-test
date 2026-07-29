@@ -547,6 +547,11 @@ func (c *Connection) handleAckFrame(f *wire.AckFrame) {
 				continue
 			}
 			packetSize := int64(len(sp.data))
+			// 若曾被 OnPacketDiscarded 递减过 bytesInFlight，先补回，
+			// 避免 OnPacketAcked 再次递减导致负值
+			if sp.lost {
+				c.congestion.OnPacketSent(packetSize)
+			}
 			c.congestion.OnPacketAcked(packetSize, int64(sp.pn), now)
 			sp.acked = true
 		}
