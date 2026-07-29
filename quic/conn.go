@@ -68,7 +68,8 @@ type Connection struct {
 
 	// ACK handling
 	recvPacketHistory        []protocol.PacketNumber
-	sendPacketHistory        []sentPacket
+	sendPacketHistory        []*sentPacket                         // ordered by PN, for loss detection
+	sendPacketMap            map[protocol.PacketNumber]*sentPacket // O(1) lookup
 	ackTimer                 *time.Timer
 	immediateAckCh           chan struct{}
 	ackElicitingSinceLastAck int
@@ -128,7 +129,8 @@ func newServerConnection(conn net.PacketConn, remoteAddr net.Addr, destConnID, s
 		maxStreamsUni:       100,
 		connMaxData:         1048576, // 1MB initial
 		recvPacketHistory:   make([]protocol.PacketNumber, 0),
-		sendPacketHistory:   make([]sentPacket, 0),
+		sendPacketHistory:   make([]*sentPacket, 0),
+		sendPacketMap:       make(map[protocol.PacketNumber]*sentPacket),
 		immediateAckCh:      make(chan struct{}, 100),
 		rttStats:            utils.NewRTTStats(),
 		congestion:          newController(cfg),
@@ -175,7 +177,8 @@ func newClientConnection(conn net.PacketConn, remoteAddr net.Addr, destConnID, s
 		maxStreamsUni:       100,
 		connMaxData:         1048576,
 		recvPacketHistory:   make([]protocol.PacketNumber, 0),
-		sendPacketHistory:   make([]sentPacket, 0),
+		sendPacketHistory:   make([]*sentPacket, 0),
+		sendPacketMap:       make(map[protocol.PacketNumber]*sentPacket),
 		immediateAckCh:      make(chan struct{}, 100),
 		rttStats:            utils.NewRTTStats(),
 		congestion:          newController(cfg),
@@ -530,64 +533,54 @@ func (c *Connection) handleAckFrame(f *wire.AckFrame) {
 		c.largestAckedPN = largestAcked
 	}
 
-	// Update RTT using the largest newly acknowledged packet
-	if largestAckedPN := int64(largestAcked); largestAckedPN >= 0 {
-		for _, sp := range c.sendPacketHistory {
-			if sp.pn == largestAcked && !sp.time.IsZero() {
-				c.rttStats.UpdateRTT(sp.time, f.DelayTime, now)
-				break
+	// Update RTT using O(1) map lookup
+	if sp, ok := c.sendPacketMap[largestAcked]; ok && !sp.time.IsZero() {
+		c.rttStats.UpdateRTT(sp.time, f.DelayTime, now)
+	}
+
+	// Process ACKs: O(ranges) using map, not O(history)
+	for _, ar := range f.AckRanges {
+		for pn := ar.Smallest; pn <= ar.Largest; pn++ {
+			sp, ok := c.sendPacketMap[pn]
+			if !ok || sp.lost {
+				continue
 			}
+			packetSize := int64(len(sp.data))
+			c.congestion.OnPacketAcked(packetSize, int64(sp.pn), now)
+			sp.lost = true // mark as acked (reuse lost flag for "processed")
 		}
 	}
 
-	acknowledgedBytes := int64(0)
-	var newHistory []sentPacket
-
-	// Process each sent packet: check if acked or lost
+	// Loss detection: only scan history once per ACK, use pre-computed lossDelay
+	// Slice 按 PN 有序，超过 largestAcked 即可停止
+	lossDelay := c.rttStats.LossDelay()
 	for _, sp := range c.sendPacketHistory {
-		if sp.lost {
+		if sp.lost || sp.retransmitted {
 			continue
 		}
-
-		// Check if this packet is acknowledged
-		acked := false
-		for _, ar := range f.AckRanges {
-			if sp.pn >= ar.Smallest && sp.pn <= ar.Largest {
-				acked = true
-				break
-			}
+		if sp.pn >= largestAcked {
+			break // 后面的 PN 更大，无需继续
 		}
-
-		if acked {
-			// Update congestion: ack this packet
+		if sp.isAckEliciting && time.Since(sp.time) > lossDelay {
+			c.logf("快速重传: pn=%d 超时=%v 已过=%v",
+				sp.pn, lossDelay, time.Since(sp.time))
 			packetSize := int64(len(sp.data))
-			acknowledgedBytes += packetSize
-			c.congestion.OnPacketAcked(packetSize, int64(sp.pn), now)
 			sp.lost = true
-		} else if !sp.retransmitted {
-			// Check if this packet should be considered lost (time-based, RFC 9002)
-			if sp.isAckEliciting && sp.pn < largestAcked {
-				lossDelay := c.rttStats.LossDelay()
-				if time.Since(sp.time) > lossDelay {
-					c.logf("快速重传: pn=%d 超时=%v 已过=%v",
-						sp.pn, lossDelay, time.Since(sp.time))
-					packetSize := int64(len(sp.data))
-					sp.lost = true
-					sp.retransmitted = true
-					c.retransmitQueue = append(c.retransmitQueue, sp)
-					c.congestion.OnPacketLost(int64(c.largestSentPN))
-					// 丢包后递减 bytesInFlight，不触发带宽估算等副作用
-					c.congestion.OnPacketDiscarded(packetSize)
-				}
-			}
-		}
-
-		if !sp.lost && !sp.retransmitted {
-			newHistory = append(newHistory, sp)
+			sp.retransmitted = true
+			c.retransmitQueue = append(c.retransmitQueue, *sp)
+			c.congestion.OnPacketLost(int64(c.largestSentPN))
+			c.congestion.OnPacketDiscarded(packetSize)
 		}
 	}
 
-	c.sendPacketHistory = newHistory
+	// Compact history periodically (keep last 8000 unprocessed entries)
+	if len(c.sendPacketHistory) > 12000 {
+		cutoff := len(c.sendPacketHistory) - 8000
+		for _, old := range c.sendPacketHistory[:cutoff] {
+			delete(c.sendPacketMap, old.pn)
+		}
+		c.sendPacketHistory = c.sendPacketHistory[cutoff:]
+	}
 
 	// Try to retransmit lost packets
 	c.flushRetransmitQueue()
@@ -788,13 +781,19 @@ func (c *Connection) sendFrame(frame wire.Frame) bool {
 	packetSize := int64(len(c.sendBuf))
 
 	// Record for potential retransmission (limit history to last 10K entries)
-	c.sendPacketHistory = append(c.sendPacketHistory, sentPacket{
+	sp := &sentPacket{
 		pn:             nextPN,
 		data:           append([]byte{}, c.sendBuf...),
 		time:           time.Now(),
 		isAckEliciting: isAckElicitingFrame(frame),
-	})
+	}
+	c.sendPacketHistory = append(c.sendPacketHistory, sp)
+	c.sendPacketMap[nextPN] = sp
 	if len(c.sendPacketHistory) > 10000 {
+		// 清理旧 map 条目
+		for _, old := range c.sendPacketHistory[:1000] {
+			delete(c.sendPacketMap, old.pn)
+		}
 		c.sendPacketHistory = c.sendPacketHistory[1000:]
 	}
 
@@ -926,11 +925,13 @@ func (c *Connection) sendInitialPacket(frame wire.Frame) {
 	}
 
 	// Record
-	c.sendPacketHistory = append(c.sendPacketHistory, sentPacket{
+	sp := &sentPacket{
 		pn:   nextPN,
 		data: append([]byte{}, c.sendBuf...),
 		time: time.Now(),
-	})
+	}
+	c.sendPacketHistory = append(c.sendPacketHistory, sp)
+	c.sendPacketMap[nextPN] = sp
 
 	_, err = c.conn.WriteTo(c.sendBuf, c.remoteAddr)
 	if err != nil {
