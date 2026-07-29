@@ -22,34 +22,47 @@ const (
 func main() {
 	if len(os.Args) < 3 {
 		fmt.Println("用法:")
-		fmt.Println("  上传: fileclient upload <本地文件路径>")
-		fmt.Println("  下载: fileclient download <远程文件名> [保存路径]")
+		fmt.Println("  上传: fileclient upload <本地文件路径> [-server host:port,...]")
+		fmt.Println("  下载: fileclient download <远程文件名> [保存路径] [-server host:port,...]")
 		fmt.Println("示例:")
 		fmt.Println("  fileclient upload ./example.mp4")
+		fmt.Println("  fileclient upload ./example.mp4 -server 10.0.0.1:4242,10.0.0.2:4242")
 		fmt.Println("  fileclient download example.mp4")
 		fmt.Println("  fileclient download example.mp4 ./mycopy.mp4")
 		os.Exit(1)
 	}
 
-	mode := strings.ToLower(os.Args[1])
+	// 解析 -server 参数（逗号分隔多地址，默认 localhost）
+	serverAddrs := []string{"[::1]:4242"}
+	var cleanArgs []string
+	for i := 0; i < len(os.Args); i++ {
+		if os.Args[i] == "-server" && i+1 < len(os.Args) {
+			serverAddrs = splitAddrs(os.Args[i+1])
+			i++ // skip value
+		} else {
+			cleanArgs = append(cleanArgs, os.Args[i])
+		}
+	}
+
+	mode := strings.ToLower(cleanArgs[1])
 
 	switch mode {
 	case "upload":
-		if len(os.Args) < 3 {
+		if len(cleanArgs) < 3 {
 			log.Fatal("请指定要上传的文件路径")
 		}
-		if err := uploadFile(os.Args[2]); err != nil {
+		if err := uploadFile(cleanArgs[2], serverAddrs); err != nil {
 			log.Fatal(err)
 		}
 	case "download":
-		if len(os.Args) < 3 {
+		if len(cleanArgs) < 3 {
 			log.Fatal("请指定要下载的文件名")
 		}
 		savePath := ""
-		if len(os.Args) >= 4 {
-			savePath = os.Args[3]
+		if len(cleanArgs) >= 4 {
+			savePath = cleanArgs[3]
 		}
-		if err := downloadFile(os.Args[2], savePath); err != nil {
+		if err := downloadFile(cleanArgs[2], savePath, serverAddrs); err != nil {
 			log.Fatal(err)
 		}
 	default:
@@ -57,13 +70,32 @@ func main() {
 	}
 }
 
+// splitAddrs 将逗号分隔的地址字符串拆分为切片，自动补全端口
+func splitAddrs(s string) []string {
+	parts := strings.Split(s, ",")
+	addrs := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		// 若无端口，补默认端口 8607
+		if !strings.Contains(p, ":") {
+			p += ":8607"
+		}
+		addrs = append(addrs, p)
+	}
+	return addrs
+}
+
 // ---- 连接复用 ----
 
-func dialServer() (*quic.Connection, error) {
+func dialServer(remoteAddrs []string) (*quic.Connection, error) {
 	cfg := &quic.Config{
 		CongestionControl: quic.CongestionBBR,
 	}
-	addrs := []string{"[::1]:4242", "127.0.0.1:4242"}
+	// 合并 localhost + 用户指定的远程地址
+	addrs := append([]string{"[::1]:4242"}, remoteAddrs...)
 	fmt.Printf("连接服务器 %v ...\n", addrs)
 
 	conn, err := quic.DialHappy(context.Background(), addrs, cfg)
@@ -76,7 +108,7 @@ func dialServer() (*quic.Connection, error) {
 
 // ---- 上传 ----
 
-func uploadFile(filePath string) error {
+func uploadFile(filePath string, serverAddrs []string) error {
 	f, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("打开文件失败: %w", err)
@@ -92,7 +124,7 @@ func uploadFile(filePath string) error {
 
 	fmt.Printf("准备上传: %s (%s)\n", fileName, formatSize(fileSize))
 
-	conn, err := dialServer()
+	conn, err := dialServer(serverAddrs)
 	if err != nil {
 		return err
 	}
@@ -178,14 +210,14 @@ func uploadFile(filePath string) error {
 
 // ---- 下载 ----
 
-func downloadFile(remoteName, savePath string) error {
+func downloadFile(remoteName, savePath string, serverAddrs []string) error {
 	if savePath == "" {
 		savePath = filepath.Base(remoteName)
 	}
 
 	fmt.Printf("准备下载: %s -> %s\n", remoteName, savePath)
 
-	conn, err := dialServer()
+	conn, err := dialServer(serverAddrs)
 	if err != nil {
 		return err
 	}

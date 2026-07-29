@@ -127,8 +127,9 @@ func (s *Stream) Write(b []byte) (int, error) {
 	written := 0
 	for written < len(b) {
 		chunkSize := len(b) - written
-		if chunkSize > 1024 {
-			chunkSize = 1024
+		// 用 MTU 上限 - 包头开销，减少分包数
+		if chunkSize > 1200 {
+			chunkSize = 1200
 		}
 
 		s.mu.Lock()

@@ -78,12 +78,16 @@ type BBR struct {
 	roundStart      bool
 	nextRoundPktNum int64 // packet number to start next round
 	roundDelivered  int64 // bytes delivered at start of round
-	packetDelivered int64 // total bytes delivered so far
+
+	// Per-round bandwidth estimation
+	roundBytesDelivered int64     // bytes delivered in current round
+	roundStartTime      time.Time // when current round started
+	prevRoundBw         float64   // delivery rate from previous round (for bwGrewThisRound)
+	packetDelivered     int64     // total bytes delivered so far
 
 	// Delivery rate tracking
-	delivered     int64 // cumulative bytes delivered
-	deliveredTime time.Time
-	appLimited    bool
+	delivered  int64 // cumulative bytes delivered
+	appLimited bool
 
 	// Pacing & window
 	pacingRate float64 // bytes/sec
@@ -110,6 +114,7 @@ type BBR struct {
 	// Loss recovery
 	inRecovery    atomic.Bool
 	recoveryPoint int64
+	lossInStartup int // 统计 Startup 阶段丢包次数
 
 	// RTT stats reference
 	rttStats *RTTStats
@@ -149,21 +154,10 @@ func (b *BBR) OnPacketAcked(ackedBytes int64, packetNumber int64, now time.Time)
 	// Track total delivered bytes
 	b.delivered += ackedBytes
 
-	// Update delivery rate estimate
-	if !b.deliveredTime.IsZero() {
-		elapsed := now.Sub(b.deliveredTime).Seconds()
-		if elapsed > 0 {
-			rate := float64(ackedBytes) / elapsed
-			b.updateBtlBw(rate)
-		}
-	}
-	b.deliveredTime = now
-
-	// Check for round start
-	if packetNumber >= b.nextRoundPktNum {
-		b.roundStart = true
-		b.nextRoundPktNum = packetNumber + 1
-		b.roundCount++
+	// Accumulate bytes for round-based delivery rate
+	b.roundBytesDelivered += ackedBytes
+	if b.roundStartTime.IsZero() {
+		b.roundStartTime = now
 	}
 
 	// Update min RTT from RTTStats if available
@@ -173,6 +167,26 @@ func (b *BBR) OnPacketAcked(ackedBytes int64, packetNumber int64, now time.Time)
 			b.rtProp = minRTT
 			b.rtPropStamp = now
 		}
+	}
+
+	// Check for round start
+	if packetNumber >= b.nextRoundPktNum {
+		b.roundStart = true
+		b.nextRoundPktNum = packetNumber + 1
+		b.roundCount++
+
+		// Compute delivery rate for the round that just ended
+		if b.roundBytesDelivered > 0 && !b.roundStartTime.IsZero() {
+			elapsed := now.Sub(b.roundStartTime).Seconds()
+			if elapsed > 0 {
+				rate := float64(b.roundBytesDelivered) / elapsed
+				b.updateBtlBw(rate)
+				b.prevRoundBw = rate
+			}
+		}
+		// Reset for next round
+		b.roundBytesDelivered = 0
+		b.roundStartTime = now
 	}
 
 	// Advance BBR state machine on round start
@@ -189,12 +203,17 @@ func (b *BBR) OnPacketAcked(ackedBytes int64, packetNumber int64, now time.Time)
 // BBR doesn't react strongly to loss (not a congestion signal).
 func (b *BBR) OnPacketLost(largestSentPNSinceLastLoss int64) {
 	// BBR doesn't reduce cwnd on loss like NewReno
-	// Unless in Startup, where loss may indicate pipe is full
+	// In Startup, tolerate random loss on WAN paths; only exit after consecutive losses
 	if b.state == bbrStateStartup {
-		b.state = bbrStateDrain
+		b.lossInStartup++
+		if b.lossInStartup >= 3 {
+			b.state = bbrStateDrain
+			b.lossInStartup = 0
+		}
+	} else {
+		b.inRecovery.Store(true)
+		b.recoveryPoint = largestSentPNSinceLastLoss
 	}
-	b.inRecovery.Store(true)
-	b.recoveryPoint = largestSentPNSinceLastLoss
 }
 
 // OnPacketDiscarded decrements bytes in flight (packet lost, not ACKed).
@@ -220,11 +239,10 @@ func (b *BBR) CanSend(bytes int64) bool {
 	// Pacing check: ensure bursts don't exceed pacingRate
 	if b.pacingRate > 0 {
 		interval := time.Duration(float64(bytes) / b.pacingRate * float64(time.Second))
-		nextAllowed := b.lastSendTime.Add(interval)
-		if time.Now().Before(nextAllowed) {
+		if time.Now().Before(b.lastSendTime.Add(interval)) {
 			return false
 		}
-		b.lastSendTime = time.Now().Add(interval)
+		b.lastSendTime = time.Now()
 	}
 	return true
 }
@@ -270,6 +288,7 @@ func (b *BBR) advanceState(now time.Time) {
 		// Exit startup if BW stops growing (no 25% increase in a round)
 		if b.roundCount >= 3 && !b.bwGrewThisRound() {
 			b.state = bbrStateDrain
+			b.lossInStartup = 0
 		}
 
 	case bbrStateDrain:
@@ -303,9 +322,11 @@ func (b *BBR) advanceState(now time.Time) {
 }
 
 func (b *BBR) bwGrewThisRound() bool {
-	// Simple check: if current BW filter max is 25% more than one round ago
-	// In practice, we'd track per-round max BW
-	return false // simplified: assume pipe is full after Startup
+	// 比较当前轮和上一轮的带宽：如果当前 btlBw >= 1.25 * 上一轮带宽，说明还在增长
+	if b.prevRoundBw <= 0 {
+		return true // 第一轮，认为在增长
+	}
+	return b.btlBw >= 1.25*b.prevRoundBw
 }
 
 func (b *BBR) updatePacingAndCwnd() {

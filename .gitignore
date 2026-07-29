@@ -1,3 +1,5 @@
 .history/
 *.exe
+*.zip
+received_files/
 
