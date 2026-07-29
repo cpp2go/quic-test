@@ -547,6 +547,11 @@ func (c *Connection) handleAckFrame(f *wire.AckFrame) {
 				continue
 			}
 			packetSize := int64(len(sp.data))
+			// 丢包重传被 ACK：OnPacketDiscarded 已递减过 inFlight，
+			// 先补回 +N 再 OnPacketAcked(-N) = 净值 0，避免二次递减
+			if sp.lost {
+				c.congestion.OnPacketSent(packetSize)
+			}
 			c.congestion.OnPacketAcked(packetSize, int64(sp.pn), now)
 			sp.acked = true
 		}
@@ -620,8 +625,6 @@ func (c *Connection) flushRetransmitQueue() {
 			remaining = append(remaining, sp)
 		} else {
 			c.logf("重传 pn=%d 成功", sp.pn)
-			// 重传包计入 bytesInFlight，与原始丢包抵消
-			c.congestion.OnPacketSent(int64(len(sp.data)))
 			// 更新原始条目：重置时间以便再次丢包时能重新检测
 			c.historyMu.Lock()
 			if orig, ok := c.sendPacketMap[sp.pn]; ok {

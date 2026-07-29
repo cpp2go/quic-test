@@ -44,8 +44,8 @@ const (
 
 	bbrProbeRTTInterval = 10 * time.Second       // refresh min RTT every 10s
 	bbrProbeRTTDuration = 200 * time.Millisecond // drain for 200ms
-	bbrMinPipeCwnd      = 262144                 // minimum cwnd (bytes), 匹配大文件传输
-	bbrMinPacingRate    = 1048576                // minimum pacing rate (1MB/s), 防止高丢包路径坍缩
+	bbrMinPipeCwnd      = 2097152                // minimum cwnd 2MB (高丢包WAN路径)
+	bbrMinPacingRate    = 4194304                // minimum pacing rate 4MB/s
 
 	// Bandwidth filter window (number of round trips)
 	bbrBWFilterLen = 10
