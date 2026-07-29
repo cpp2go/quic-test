@@ -37,14 +37,15 @@ const (
 	// ProbeBW gain cycle
 	bbrPacingGainStartup = 2.0
 	bbrPacingGainDrain   = 1.0 / 2.77
-	bbrCWNDGainStartup   = 2.0
+	bbrCWNDGainStartup   = 8.0 // Startup 阶段大 cwnd，避免限制带宽探测
 	bbrCWNDGainDrain     = 2.0
-	bbrCWNDGainProbeBW   = 2.0
+	bbrCWNDGainProbeBW   = 4.0 // ProbeBW 较高 cwnd，匹配大文件传输
 	bbrCWNDGainProbeRTT  = 1.0
 
 	bbrProbeRTTInterval = 10 * time.Second       // refresh min RTT every 10s
 	bbrProbeRTTDuration = 200 * time.Millisecond // drain for 200ms
 	bbrMinPipeCwnd      = 262144                 // minimum cwnd (bytes), 匹配大文件传输
+	bbrMinPacingRate    = 1048576                // minimum pacing rate (1MB/s), 防止高丢包路径坍缩
 
 	// Bandwidth filter window (number of round trips)
 	bbrBWFilterLen = 10
@@ -118,7 +119,7 @@ type BBR struct {
 func NewBBR() *BBR {
 	b := &BBR{
 		state:   bbrStateStartup,
-		rtProp:  333 * time.Millisecond,
+		rtProp:  100 * time.Millisecond,
 		minCwnd: bbrMinPipeCwnd,
 	}
 	b.pacingRate.Store(int64(float64(b.minCwnd) / b.rtProp.Seconds()))
@@ -357,6 +358,10 @@ func (b *BBR) updatePacingAndCwnd() {
 	rate := pacingGain * b.btlBw
 	if rate == 0 {
 		rate = float64(b.minCwnd) / b.rtProp.Seconds()
+	}
+	// 最小 pacing rate 防止高丢包路径坍缩
+	if rate < bbrMinPacingRate {
+		rate = bbrMinPacingRate
 	}
 	b.pacingRate.Store(int64(rate))
 
