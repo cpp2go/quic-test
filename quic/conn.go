@@ -621,7 +621,8 @@ func (c *Connection) handleAckFrame(f *wire.AckFrame) {
 	c.flushRetransmitQueue()
 }
 
-// flushRetransmitQueue retransmits any packets that were detected as lost.
+// flushRetransmitQueue retransmits lost packets with NEW packet numbers (quic-go style).
+// Using new PNs allows the congestion controller to exit recovery naturally.
 func (c *Connection) flushRetransmitQueue() {
 	if len(c.retransmitQueue) == 0 {
 		return
@@ -633,25 +634,56 @@ func (c *Connection) flushRetransmitQueue() {
 	var remaining []sentPacket
 	for _, sp := range c.retransmitQueue {
 		packetSize := int64(sp.dataLen)
-		// 正常发送路径已绕过拥塞窗口，重传也必须绕过，否则丢的包永远无法恢复
 		if !c.congestion.CanSend(packetSize) {
 			c.logf("重传拥塞告警: cwnd=%d inFlight=%d, 仍重传 pn=%d",
 				c.congestion.Cwnd(), c.congestion.BytesInFlight(), sp.pn)
 		}
-		_, err := c.conn.WriteTo(sp.buf[:sp.dataLen], c.remoteAddr)
+
+		// Get new PN for retransmission (quic-go: retransmitted data gets new PN)
+		nextPN := protocol.PacketNumber(c.sendPN.Add(1) - 1)
+		if nextPN > c.largestSentPN {
+			c.largestSentPN = nextPN
+		}
+		newPNLen := protocol.PacketNumberLengthForHeader(nextPN, 0)
+		oldPNLen := protocol.PacketNumberLengthForHeader(sp.pn, 0)
+
+		// Extract frame payload from old buffer (skip old short header)
+		oldHdrLen := 1 + c.destConnID.Len() + int(oldPNLen)
+		var framePayload []byte
+		if oldHdrLen < sp.dataLen {
+			framePayload = sp.buf[oldHdrLen:sp.dataLen]
+		}
+
+		// Rebuild packet with new PN
+		c.sendBuf = c.sendBuf[:0]
+		c.sendBuf = wire.AppendShortHeader(c.sendBuf, c.destConnID, nextPN, newPNLen)
+		c.sendBuf = append(c.sendBuf, framePayload...)
+
+		newPacketSize := int64(len(c.sendBuf))
+		_, err := c.conn.WriteTo(c.sendBuf, c.remoteAddr)
 		if err != nil {
 			c.logf("重传错误 pn=%d: %v", sp.pn, err)
 			remaining = append(remaining, sp)
 		} else {
-			c.logf("重传 pn=%d 成功", sp.pn)
-			// 重传计入拥塞控制，避免 inFlight 变负
-			c.congestion.OnPacketSent(packetSize)
-			// 更新原始条目：重置时间与状态以便再次丢包时能重新检测
+			c.logf("重传 pn=%d -> %d 成功", sp.pn, nextPN)
+			c.congestion.OnPacketSent(newPacketSize)
+
+			// Record new packet in history with new PN
+			newSp := sentPacketPool.Get().(*sentPacket)
+			newSp.pn = nextPN
+			copy(newSp.buf[:], c.sendBuf)
+			newSp.dataLen = len(c.sendBuf)
+			newSp.time = time.Now()
+			newSp.isAckEliciting = true
+			newSp.acked = false
+			newSp.lost = false
+			newSp.retransmitted = false
 			c.historyMu.Lock()
+			c.sendPacketHistory = append(c.sendPacketHistory, newSp)
+			c.sendPacketMap[nextPN] = newSp
+			// Mark old entry as acked so compactSentHistory cleans it up
 			if orig, ok := c.sendPacketMap[sp.pn]; ok {
-				orig.time = time.Now()
-				orig.retransmitted = false
-				orig.lost = false // 重置后，若再次丢包才会触发 OnPacketDiscarded
+				orig.acked = true
 			}
 			c.historyMu.Unlock()
 		}
