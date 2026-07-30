@@ -642,6 +642,17 @@ func (c *Connection) flushRetransmitQueue() {
 				c.congestion.Cwnd(), c.congestion.BytesInFlight(), sp.pn)
 		}
 
+		// Skip long header packets: setup frames (PING/MAX_DATA) don't need retransmission
+		if sp.dataLen > 0 && sp.buf[0]&0x80 != 0 {
+			c.logf("跳过 long header 包 pn=%d, 标记已确认", sp.pn)
+			c.historyMu.Lock()
+			if orig, ok := c.sendPacketMap[sp.pn]; ok {
+				orig.acked = true
+			}
+			c.historyMu.Unlock()
+			continue
+		}
+
 		// Get new PN for retransmission (quic-go: retransmitted data gets new PN)
 		nextPN := protocol.PacketNumber(c.sendPN.Add(1) - 1)
 		if nextPN > c.largestSentPN {
