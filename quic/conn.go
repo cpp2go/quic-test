@@ -144,6 +144,7 @@ type sentPacket struct {
 	acked          bool // 已被对端 ACK
 	lost           bool // 已检测为丢包（加入重传队列）
 	retransmitted  bool // 已加入重传队列（防止重复入队）
+	isRetransmit   bool // 由重传创建的新包（PTO 跳过以免无限循环）
 }
 
 func newServerConnection(conn net.PacketConn, remoteAddr net.Addr, destConnID, srcConnID protocol.ConnectionID, version protocol.Version, cfg *Config) *Connection {
@@ -490,7 +491,7 @@ func (c *Connection) parseAndHandleFrames(data []byte) {
 	for offset < len(data) {
 		frame, consumed, err := parser.ParseNext(data[offset:])
 		if err != nil {
-			c.logf("error parsing frame: %v", err)
+			// Unknown/corrupt frame: skip rest of packet, peer will retransmit
 			break
 		}
 		offset += consumed
@@ -680,6 +681,7 @@ func (c *Connection) flushRetransmitQueue() {
 			newSp.acked = false
 			newSp.lost = false
 			newSp.retransmitted = false
+			newSp.isRetransmit = true // PTO should skip retransmit-created packets
 			c.historyMu.Lock()
 			c.sendPacketHistory = append(c.sendPacketHistory, newSp)
 			c.sendPacketMap[nextPN] = newSp
@@ -881,6 +883,7 @@ func (c *Connection) sendFrame(frame wire.Frame) bool {
 	sp.acked = false
 	sp.lost = false
 	sp.retransmitted = false
+	sp.isRetransmit = false
 	c.historyMu.Lock()
 	c.sendPacketHistory = append(c.sendPacketHistory, sp)
 	c.sendPacketMap[nextPN] = sp
@@ -984,9 +987,9 @@ func (c *Connection) checkPTO() {
 	c.logf("PTO 触发 #%d: 超时=%v, 重置拥塞状态, 未确认包=%d", c.ptoCount, time.Since(lastAck), len(c.sendPacketHistory))
 	c.congestion.OnPacketNeedsRetransmit()
 
-	// Retransmit all outstanding packets
+	// Retransmit all outstanding ORIGINAL packets (skip retransmitted ones to avoid infinite loop)
 	for _, sp := range c.sendPacketHistory {
-		if sp.acked || sp.retransmitted {
+		if sp.acked || sp.retransmitted || sp.isRetransmit {
 			continue
 		}
 		sp.retransmitted = true
@@ -1095,10 +1098,13 @@ func (c *Connection) sendInitialPacket(frame wire.Frame) {
 	sp.acked = false
 	sp.lost = false
 	sp.retransmitted = false
+	sp.isRetransmit = false
 	c.historyMu.Lock()
 	c.sendPacketHistory = append(c.sendPacketHistory, sp)
 	c.sendPacketMap[nextPN] = sp
 	c.historyMu.Unlock()
+
+	c.congestion.OnPacketSent(int64(len(c.sendBuf)))
 
 	_, err = c.conn.WriteTo(c.sendBuf, c.remoteAddr)
 	if err != nil {
